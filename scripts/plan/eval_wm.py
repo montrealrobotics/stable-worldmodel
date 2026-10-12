@@ -44,17 +44,6 @@ def episode_col(dataset):
     return 'episode_idx' if 'episode_idx' in names else 'ep_idx'
 
 
-def get_episodes_length(dataset, episodes):
-    col_name = episode_col(dataset)
-
-    episode_idx = dataset.get_col_data(col_name)
-    step_idx = dataset.get_col_data('step_idx')
-    lengths = []
-    for ep_id in episodes:
-        lengths.append(np.max(step_idx[episode_idx == ep_id]) + 1)
-    return np.array(lengths)
-
-
 def get_dataset(cfg, dataset_name):
     dataset = swm.data.load_dataset(
         dataset_name,
@@ -80,21 +69,18 @@ def evaluation_kwargs(cfg, dataset):
         }
     if source != 'dataset':
         raise ValueError(f'Unknown evaluation source: {source!r}')
-    ep_indices = np.unique(dataset.get_col_data(episode_col(dataset)))
-    # sample the episodes and the starting indices
-    episode_len = get_episodes_length(dataset, ep_indices)
-    max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
-    max_start_idx_dict = {
-        ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)
-    }
-    # Map each dataset row’s episode_idx to its max_start_idx
     col_name = episode_col(dataset)
-    max_start_per_row = np.array(
-        [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
+    print('[eval] reading episode indices...', flush=True)
+    episode_idx = dataset.get_col_data(col_name)
+    print('[eval] reading step indices...', flush=True)
+    step_idx = dataset.get_col_data('step_idx')
+    print('[eval] computing valid starting points...', flush=True)
+    episodes, row_episode = np.unique(episode_idx, return_inverse=True)
+    last_step = np.full(len(episodes), -1, dtype=step_idx.dtype)
+    np.maximum.at(last_step, row_episode, step_idx)
+    valid_mask = (
+        step_idx <= last_step[row_episode] - cfg.eval.goal_offset_steps
     )
-
-    # remove all the lines of dataset for which dataset['step_idx'] > max_start_per_row
-    valid_mask = dataset.get_col_data('step_idx') <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
     print(valid_mask.sum(), 'valid starting points found for evaluation.')
 
@@ -111,8 +97,8 @@ def evaluation_kwargs(cfg, dataset):
     # Index the full index columns directly: the Lance reader excludes
     # index columns (episode_idx/step_idx) from get_row_data, but get_col_data
     # exposes them (and both are already cached from the checks above).
-    eval_episodes = dataset.get_col_data(col_name)[random_episode_indices]
-    eval_start_idx = dataset.get_col_data('step_idx')[random_episode_indices]
+    eval_episodes = episode_idx[random_episode_indices]
+    eval_start_idx = step_idx[random_episode_indices]
 
     if len(eval_episodes) < cfg.eval.num_eval:
         raise ValueError(
@@ -138,6 +124,13 @@ def run(cfg: DictConfig):
         cfg.plan_config.horizon * cfg.plan_config.action_block
         <= cfg.eval.eval_budget
     ), 'Planning horizon must be smaller than or equal to eval_budget'
+
+    # Dataset goals do not need PPO expert rollouts.
+    if (
+        cfg.eval.get('source', 'dataset') == 'dataset'
+        and 'expert_checkpoint' in cfg.world
+    ):
+        cfg.world.expert_checkpoint = None
 
     # create world environment
     if cfg.world.get('max_episode_steps') is None:
@@ -172,7 +165,9 @@ def run(cfg: DictConfig):
     policy = cfg.get('policy', 'random')
 
     if policy != 'random':
+        print('[eval] loading model checkpoint...', flush=True)
         model = swm.wm.utils.load_pretrained(cfg.policy)
+        print('[eval] moving model to planning device...', flush=True)
         if cfg.get('bf16', False):
             model = model.to(torch.bfloat16)
         model = model.to(cfg.solver.get('device', 'cuda'))
@@ -211,6 +206,7 @@ def run(cfg: DictConfig):
     if cfg.get('subdir'):
         results_path = results_path / 'evals' / cfg.subdir
 
+    print('[eval] selecting evaluation starts and goals...', flush=True)
     eval_kwargs = evaluation_kwargs(cfg, dataset)
     if eval_kwargs.get('episodes') == world.num_envs:
         # Each env runs once; avoid generating expert goals for unused resets.
@@ -244,6 +240,7 @@ def run(cfg: DictConfig):
             world.evaluate(**warmup_kwargs, video=results_path)
         print('Warmup done.')
 
+    print('[eval] starting evaluation...', flush=True)
     start_time = time.time()
     with autocast_ctx:
         metrics = world.evaluate(**eval_kwargs, video=results_path)

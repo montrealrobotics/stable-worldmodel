@@ -109,8 +109,6 @@ class PushTSWMEnv(gym.Env):
                         f'Expert training config mismatch for {key}: '
                         f'{value!r} != {inferred[key]!r}'
                     )
-        if state_goal and expert_checkpoint is None:
-            raise ValueError('State goals require an expert_checkpoint')
         if goal_step_distance < 1 or expert_max_steps < goal_step_distance:
             raise ValueError(
                 'Require 1 <= goal_step_distance <= expert_max_steps'
@@ -565,6 +563,32 @@ class PushTSWMEnv(gym.Env):
             for key, (_, value) in named_observation_leaves(obs).items()
         }
 
+    def _set_state(self, state):
+        """Restore a dataset simulator state and reset controller targets."""
+        base = self.env.unwrapped
+        base.set_state(torch.as_tensor(state, device=base.device)[None])
+        base.agent.controller.reset()
+        self._observation(base.get_obs())
+
+    def _set_goal_state(self, goal_state, goal=None):
+        """Capture the dataset goal without changing the planning start."""
+        base = self.env.unwrapped
+        state = single(base.get_state())
+        try:
+            base.set_state(
+                torch.as_tensor(goal_state, device=base.device)[None]
+            )
+            self._goal_pose = base.tee.pose.raw_pose.clone()
+            self._goal_eef_position = base.agent.tcp.pose.p.clone()
+            self.goal_observation = self._observation(base.get_obs())
+            self._goal = (
+                self._pixels.copy()
+                if goal is None
+                else np.asarray(goal).copy()
+            )
+        finally:
+            self._set_state(state)
+
     def reset(self, *, seed=None, options=None):
         """Reset the scene and select an image goal plus optional state fields.
 
@@ -577,6 +601,8 @@ class PushTSWMEnv(gym.Env):
         self._evaluation_seed = seed
         options = dict(options or {})
         start_from_beginning = options.pop('start_from_beginning', True)
+        self._goal_pose = None
+        self.goal_observation = None
         self._evaluation_options = copy.deepcopy(options)
         self._executed_actions = []
         obs, info = self.env.reset(seed=seed, options=options)
@@ -588,7 +614,7 @@ class PushTSWMEnv(gym.Env):
                 start_from_beginning=start_from_beginning,
             )
         observation = self._observation(obs)
-        if self._expert is None:
+        if self._goal_pose is None:
             self._goal = self._render_goal()
         self._pose_trace = []
         if self._expert is not None:
@@ -597,7 +623,7 @@ class PushTSWMEnv(gym.Env):
             **self._state_goal_info(),
             'goal': self._goal.copy(),
             'success': self._goal_reached()
-            if self._expert is not None
+            if self._goal_pose is not None
             else bool(single(info['success'])),
             'task_success': bool(single(info['success'])),
             **self._expert_metadata,
@@ -625,7 +651,9 @@ class PushTSWMEnv(gym.Env):
         self._executed_actions.append(action.copy())
         task_success = bool(single(info['success']))
         success = (
-            self._goal_reached() if self._expert is not None else task_success
+            self._goal_reached()
+            if self._goal_pose is not None
+            else task_success
         )
         # SWM counts termination as success. A task failure ends via truncation.
         done = bool(single(terminated))
@@ -769,7 +797,7 @@ class PushTSWMEnv(gym.Env):
 
     def _state_goal_info(self):
         """Copy selected state-goal fields into info under goal_ names."""
-        if not self.state_goal:
+        if not self.state_goal or self.goal_observation is None:
             return {}
         return {
             f'goal_{key}': value.copy()

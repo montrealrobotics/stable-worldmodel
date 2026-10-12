@@ -1,6 +1,7 @@
 """Tests for new World — self-contained with CounterEnv and mock policy."""
 
 from collections import deque
+from typing import ClassVar
 
 import gymnasium as gym
 import numpy as np
@@ -564,8 +565,8 @@ class FakeEvalDataset:
     """Two-episode dataset with per-episode-varying ``states`` dims plus
     episode-scoped blobs, mimicking the robocasa lance layout."""
 
-    column_names = ['pixels', 'proprio', 'states', 'seed']
-    episode_column_names = ['model_xml', 'ep_meta']
+    column_names: ClassVar = ['pixels', 'proprio', 'states', 'seed']
+    episode_column_names: ClassVar = ['model_xml', 'ep_meta']
 
     def __init__(self):
         self.lengths = np.array([6, 6])
@@ -652,6 +653,25 @@ class TestExtractInitGoal:
 
 
 class TestEvaluateFromDataset:
+    def test_results_follow_seed_order(self):
+        world = _make_world_with(
+            [lambda: DatasetResetEnv(1), lambda: DatasetResetEnv(3)]
+        )
+        results = world.evaluate(
+            dataset=FakeEvalDataset(),
+            episodes_idx=[1, 0],
+            start_steps=[0, 0],
+            goal_offset=3,
+            eval_budget=1,
+        )
+
+        assert results['seeds'] == [100, 101]
+        np.testing.assert_array_equal(
+            results['episode_successes'], [False, True]
+        )
+        assert results['episode_successes'].dtype == np.bool_
+        assert results['success_rate'] == 50.0
+
     def test_method_path_receives_rows(self):
         world = _make_world_with(
             [lambda: DatasetResetEnv(3) for _ in range(2)]

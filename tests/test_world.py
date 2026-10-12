@@ -95,6 +95,15 @@ class RecordingPolicy:
         return actions
 
 
+class ExpertCounterEnv(CounterEnv):
+    def _make_info(self, terminated):
+        return {
+            **super()._make_info(terminated),
+            'expert_seed': self._seed_val + 1000,
+            'expert_requested_seed': self._seed_val,
+        }
+
+
 def _make_world(num_envs=2, max_steps=3):
     """Build a World with CounterEnv directly, bypassing gym.make."""
     pool = EnvPool(
@@ -444,6 +453,84 @@ class TestEvaluate:
         assert 'episode_successes' in results
         assert 'seeds' in results
         assert len(results['episode_successes']) == 4
+        assert 'expert_seeds' not in results
+
+    @pytest.mark.parametrize('mode', ['auto', 'wait'])
+    def test_evaluate_records_accepted_expert_seeds(self, mode):
+        class MixedOutcomeExpertEnv(ExpertCounterEnv):
+            def _make_info(self, terminated):
+                info = super()._make_info(terminated)
+                info['expert_seed'] = 1000 - self._seed_val
+                return info
+
+            def step(self, action):
+                obs, reward, terminated, truncated, info = super().step(action)
+                if terminated and self._seed_val % 2:
+                    terminated, truncated = False, True
+                return obs, reward, terminated, truncated, info
+
+        world = _make_world(num_envs=2)
+        # Different episode lengths make completion order differ from env order.
+        world.envs = EnvPool(
+            [
+                lambda: MixedOutcomeExpertEnv(3),
+                lambda: MixedOutcomeExpertEnv(1),
+            ]
+        )
+        world.set_policy(RecordingPolicy())
+        episodes = 4 if mode == 'auto' else 2
+        results = world.evaluate(episodes=episodes, seed=10, reset_mode=mode)
+
+        requested = list(range(10, 10 + episodes))
+        np.testing.assert_array_equal(results['seeds'], requested)
+        assert results['expert_requested_seeds'] == requested
+        assert results['expert_seeds'] == [1000 - seed for seed in requested]
+        np.testing.assert_array_equal(
+            results['episode_successes'], [seed % 2 == 0 for seed in requested]
+        )
+        assert results['success_rate'] == 50.0
+
+    def test_eval_script_saves_all_expert_seeds(self, monkeypatch, tmp_path):
+        pytest.importorskip('stable_pretraining')
+        from omegaconf import OmegaConf
+
+        from scripts.plan import eval_wm
+
+        world = _make_world(num_envs=1)
+        world.envs = EnvPool([lambda: ExpertCounterEnv(1)])
+        monkeypatch.setattr(eval_wm.swm, 'World', lambda **kwargs: world)
+        monkeypatch.setattr(eval_wm, '__file__', str(tmp_path / 'eval_wm.py'))
+        monkeypatch.setattr(eval_wm, 'get_dataset', lambda *args: object())
+        monkeypatch.setattr(
+            'stable_worldmodel.world.world.save_video', lambda *args: None
+        )
+        cfg = OmegaConf.create(
+            {
+                'world': {'max_episode_steps': 1},
+                'plan_config': {'horizon': 1, 'action_block': 1},
+                'dataset': {'keys_to_cache': []},
+                'eval': {
+                    'source': 'env',
+                    'num_eval': 1200,
+                    'eval_budget': 1,
+                    'dataset_name': 'unused',
+                    'image_keys': [],
+                    'env_options': {},
+                },
+                'seed': 42,
+                'policy': 'random',
+                'output': {'filename': 'results.txt'},
+            }
+        )
+
+        eval_wm.run.__wrapped__(cfg)
+
+        saved = (tmp_path / 'results.txt').read_text()
+        requested = list(range(42, 1242))
+        accepted = [seed + 1000 for seed in requested]
+        assert f"'expert_requested_seeds': {requested}" in saved
+        assert f"'expert_seeds': {accepted}" in saved
+        assert not (tmp_path / 'results_seeds.json').exists()
 
     def test_evaluate_default_mode_is_auto(self):
         world = _make_world(num_envs=1, max_steps=2)

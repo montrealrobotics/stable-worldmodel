@@ -73,6 +73,82 @@ class FakeScene(gym.Env):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_dataset_callables_restore_start_and_goal(self):
+        class DatasetScene(FakeScene):
+            controller_resets = 0
+
+            @property
+            def agent(self):
+                agent = super().agent
+                agent.controller = SimpleNamespace(reset=self.reset_controller)
+                return agent
+
+            def reset_controller(self):
+                self.controller_resets += 1
+
+            def set_state(self, state):
+                self.steps = int(state[0, 0])
+
+            def get_info(self):
+                return {'success': torch.tensor([False])}
+
+            def step(self, action):
+                obs, reward, terminated, truncated, _ = super().step(action)
+                return obs, reward, terminated, truncated, self.get_info()
+
+        scene = DatasetScene()
+        with patch(
+            'stable_worldmodel.envs.maniskill.pusht.gym.make',
+            return_value=scene,
+        ):
+            env = PushTSWMEnv(
+                image_size=8,
+                state_goal=True,
+                goal_eef_position_tolerance=0.02,
+            )
+        goal = np.full((8, 8, 3), 77, dtype=np.uint8)
+        from pathlib import Path
+
+        from hydra import compose, initialize_config_dir
+        from omegaconf import OmegaConf
+
+        from stable_worldmodel.world.world import _apply_callables
+
+        with initialize_config_dir(
+            config_dir=str(
+                Path(__file__).resolve().parents[2] / 'scripts/plan/config'
+            ),
+            version_base=None,
+        ):
+            cfg = compose(config_name='maniskill_state_overhead')
+        with patch.object(env, '_expert_goal') as expert_goal:
+            env.reset(seed=42)
+            _apply_callables(
+                env,
+                OmegaConf.to_container(cfg.eval.callables, resolve=True),
+                {
+                    'state': np.array([4], dtype=np.float32),
+                    'goal_state': np.array([5], dtype=np.float32),
+                    'goal': goal,
+                },
+            )
+            expert_goal.assert_not_called()
+        self.assertEqual(scene.steps, 4)
+        self.assertEqual(scene.controller_resets, 2)
+        self.assertFalse(env._goal_reached())
+        np.testing.assert_array_equal(env.render(), np.full_like(goal, 4))
+        np.testing.assert_array_equal(env._goal, goal)
+        np.testing.assert_array_equal(
+            env._state_goal_info()['goal_obs_agent_qpos'], np.zeros(2)
+        )
+        torch.testing.assert_close(
+            env._goal_eef_position, torch.tensor([[0.0, 0.0, 0.5]])
+        )
+        _, _, terminated, _, info = env.step(np.zeros(2))
+        self.assertTrue(terminated)
+        self.assertTrue(info['success'])
+        self.assertFalse(info['task_success'])
+
     def test_eef_position_goal_is_captured_and_required_for_success(self):
         class EEFScene(FakeScene):
             @property

@@ -240,10 +240,15 @@ class World:
         Returns:
             A dict with ``'success_rate'`` (percent), ``'episode_successes'``
             (per-episode bool/uint array), and ``'seeds'`` used for reset.
+            Episodic evaluations also include ``'expert_seeds'`` and
+            ``'expert_requested_seeds'`` when provided by the environment,
+            recording accepted expert rollout seeds and original requests.
+            Per-episode values are ordered by reset seed in ascending order
+            when seeds are available, preserving ties in their original order.
         """
         if dataset is not None:
             mode = reset_mode or 'wait'
-            return self._evaluate_from_dataset(
+            results = self._evaluate_from_dataset(
                 dataset,
                 episodes_idx,
                 start_steps,
@@ -253,8 +258,26 @@ class World:
                 video,
                 mode,
             )
-        mode = reset_mode or 'auto'
-        return self._evaluate(episodes, seed, options, video, mode)
+        else:
+            mode = reset_mode or 'auto'
+            results = self._evaluate(episodes, seed, options, video, mode)
+
+        if results.get('seeds') is not None:
+            order = np.argsort(results['seeds'], kind='stable')
+            for key in (
+                'episode_successes',
+                'seeds',
+                'expert_seeds',
+                'expert_requested_seeds',
+            ):
+                if key in results:
+                    values = results[key]
+                    results[key] = (
+                        values[order]
+                        if isinstance(values, np.ndarray)
+                        else [values[i] for i in order]
+                    )
+        return results
 
     def collect(
         self,
@@ -507,6 +530,15 @@ class World:
         def on_done(env_idx, ep_idx, world):
             results['episode_successes'][ep_idx] = world.terminateds[env_idx]
             results['seeds'][ep_idx] = world.envs.seeds[env_idx]
+            for info_key, result_key in (
+                ('expert_seed', 'expert_seeds'),
+                ('expert_requested_seed', 'expert_requested_seeds'),
+            ):
+                if info_key in world.infos:
+                    values = results.setdefault(result_key, [None] * episodes)
+                    values[ep_idx] = int(
+                        np.asarray(world.infos[info_key][env_idx]).item()
+                    )
             if frames is not None:
                 save_video(
                     Path(video) / f'episode_{ep_idx}.mp4',
