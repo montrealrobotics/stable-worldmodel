@@ -1,0 +1,53 @@
+defaults:
+  - launcher: local
+  - data: pusht
+  - _self_
+
+world_model: ??? # pretrained LeWM weights.pt or weights_epoch_N.pt
+output_model_name: lewm_gcbc
+seed: 3072
+train_split: 0.9
+img_size: 224
+num_workers: 6
+goal_mean_steps: 25 # geometric sampler, mixed equally with uniform future goals
+# PushT environment bounds, before LeWM's action normalization.
+action_low: [-1, -1]
+action_high: [1, 1]
+
+data:
+  dataset:
+    num_steps: 1
+    frameskip: 5 # must match the pretrained LeWM
+
+model:
+  _target_: stable_worldmodel.wm.lewm_gcbc.LeWMGCBC
+  world_model: ???
+  latent_dim: ???
+  action_dim: ???
+  action_block: ???
+  action_low: ???
+  action_high: ???
+  normalization: ???
+  hidden_dim: 256
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  drop_last: true
+  persistent_workers: true
+  prefetch_factor: 3
+  pin_memory: true
+  shuffle: true
+
+optimizer:
+  type: AdamW
+  lr: 1e-4
+  weight_decay: 1e-3
+
+trainer:
+  default_root_dir: ${oc.env:STABLEWM_HOME}/checkpoints/${subdir}/pl_trainer
+  max_epochs: 10
+  devices: 1
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0

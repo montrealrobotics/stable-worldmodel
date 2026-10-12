@@ -184,6 +184,70 @@ These commands are useful for checking that the dataset and training
 dependencies are wired correctly. For real experiments, increase epochs,
 batch size, image resolution, and model size according to your hardware.
 
+## Train a LeWM behavior-cloning prior
+
+Train a small Gaussian MLP on expert actions using a pretrained LeWM's frozen
+encoder and projector. Inputs are the current latent and goal latent.
+Only the policy head is optimized with Gaussian negative
+log-likelihood; LeWM's prediction and SIGReg training remain unchanged.
+
+From the repository root:
+
+```bash
+export STABLEWM_HOME=$PWD/.stablewm
+python -m scripts.train.lewm_gcbc \
+  world_model=lewm/weights_epoch_10.pt \
+  data.dataset.name=pusht_expert_train.lance \
+  subdir=lewm_prior wandb.enabled=false
+```
+
+Use the same dataset, observation columns, `img_size`, and action normalization
+as the pretrained LeWM. Set `data.dataset.frameskip` to its action-block size:
+five means five distinct environment actions, all supervised from the current
+frame. Set `action_low` and `action_high` to the environment's physical bounds
+(the defaults are PushT's `[-1, 1]`). The trainer normalizes these bounds using
+the dataset's existing column scaler. It excludes nonfinite action blocks and
+splits by episode. Future goals are sampled within the same episode, with an
+equal mixture of uniform and geometric offsets; `goal_mean_steps=25` sets the
+geometric mean before episode-end truncation, in environment steps.
+
+For a CPU smoke run, add `trainer.accelerator=cpu trainer.precision=32-true
+num_workers=0 loader.batch_size=8 trainer.max_epochs=1`.
+Exports live at `checkpoints/lewm_prior/weights_epoch_N.pt` with `config.json`.
+They contain the policy, frozen LeWM, and normalization statistics and load
+through `load_pretrained` without the original LeWM checkpoint.
+
+Evaluate all three modes with the existing dataset-start/goal pipeline:
+
+```bash
+# BC alone, executing each predicted block in order.
+python -m scripts.plan.eval_wm \
+  policy=lewm_prior/weights_epoch_10.pt +policy_mode=bc
+
+# Original CEM; no prior is enabled by default.
+python -m scripts.plan.eval_wm policy=lewm/weights_epoch_10.pt \
+  +plan_config.history_len=3
+
+# CEM initialized by the BC prior and its bundled LeWM.
+python -m scripts.plan.eval_wm policy=lewm/weights_epoch_10.pt \
+  +bc_prior=lewm_prior/weights_epoch_10.pt +plan_config.history_len=3
+```
+
+Use identical evaluation starts, goals, budgets, and action-block settings;
+set `eval.dataset_name` to your evaluation dataset and match `eval.img_size`
+to training. `plan_config.history_len` must match LeWM's context size for
+planning. BC uses the current observation only. Evaluation uses Gaussian means;
+`prior.get_action(info, horizon=5, sample=True)` samples a stochastic block.
+
+CEM reuses its actor initialization/tail-fill interface rather than injecting
+a 50/50 mixture, which would require a new solver sampling hook. The prior
+rolls out LeWM with executed history and any previous plan prefix to initialize
+the mean; CEM refines it using its existing distribution. Guided candidates
+are clipped to normalized action bounds before scoring and elite selection.
+Prefix rollouts currently replay history, so long planning horizons incur
+quadratic predictor work. The prior supports flat LeWM embeddings, including
+state LeWM; patch-token models are excluded.
+
 ## Save a custom model
 
 If you train your own model, save it with the checkpoint format used by the

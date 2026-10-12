@@ -628,6 +628,39 @@ class GoalDataset:
         if not self.goal_keys:
             return steps
 
+        goal_ep_idx, goal_local_idx = self._sample_goal_step(idx)
+        goal_step = self._load_single_step(goal_ep_idx, goal_local_idx)
+        return self._add_goal(steps, goal_step)
+
+    def __getitems__(self, indices: list[int]) -> list[dict]:
+        """Keep Lance's batched reads when adding randomly sampled goals."""
+        load_slices = getattr(self.dataset, '_load_slices', None)
+        if load_slices is None:
+            return [self[idx] for idx in indices]
+        slices = [
+            (ep, start, start + self.dataset.span)
+            for ep, start in (self._get_clip_info(idx) for idx in indices)
+        ]
+        if self.goal_keys:
+            slices.extend(
+                (ep, step, step + 1)
+                for ep, step in (
+                    self._sample_goal_step(idx) for idx in indices
+                )
+            )
+        loaded = load_slices(slices)
+        samples = loaded[: len(indices)]
+        for sample in samples:
+            if 'action' in sample:
+                sample['action'] = sample['action'].reshape(
+                    self.dataset.num_steps, -1
+                )
+        if self.goal_keys:
+            for sample, goal in zip(samples, loaded[len(indices) :]):
+                self._add_goal(sample, goal)
+        return samples
+
+    def _sample_goal_step(self, idx: int) -> tuple[int, int]:
         ep_idx, local_start = self._get_clip_info(idx)
 
         goal_kind = self._sample_goal_kind()
@@ -648,8 +681,9 @@ class GoalDataset:
             )
             goal_ep_idx = ep_idx
 
-        goal_step = self._load_single_step(goal_ep_idx, goal_local_idx)
+        return goal_ep_idx, goal_local_idx
 
+    def _add_goal(self, steps: dict, goal_step: dict) -> dict:
         for src_key, goal_key in self.goal_keys.items():
             if src_key not in goal_step or src_key not in steps:
                 continue

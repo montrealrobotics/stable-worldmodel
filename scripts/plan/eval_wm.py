@@ -16,6 +16,52 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 
 import stable_worldmodel as swm
+from stable_worldmodel.data import ZScoreScaler
+from stable_worldmodel.wm.lewm_gcbc import LeWMGCBC
+
+
+def make_policy(cfg, model, process, transform):
+    """Use native BC execution or CEM, optionally initialized by a BC prior."""
+    mode = cfg.get('policy_mode', 'cem')
+    if mode not in ('bc', 'cem'):
+        raise ValueError('policy_mode must be bc or cem')
+    prior = model if isinstance(model, LeWMGCBC) else None
+    history_keys = ('pixels',)
+    if prior is not None:
+        if prior.action_block != cfg.plan_config.action_block:
+            raise ValueError('Prior action_block must match planning config')
+        process = {
+            key: ZScoreScaler(**stats)
+            for key, stats in prior.normalization.items()
+        }
+        process.update(
+            {f'goal_{k}': v for k, v in list(process.items()) if k != 'action'}
+        )
+        model = prior.world_model
+        history_keys = tuple(
+            getattr(model, 'state_columns', ()) or ('pixels',)
+        )
+    if mode == 'bc':
+        if prior is None:
+            raise ValueError('BC evaluation requires a LeWMGCBC checkpoint')
+        return swm.policy.FeedForwardPolicy(
+            prior,
+            process=process,
+            transform=transform,
+            action_chunk_size=prior.action_block,
+            history_keys=history_keys,
+            clip_actions=True,
+        )
+    objective = hydra.utils.instantiate(cfg.objective)
+    cost = swm.planning.ShootingCostEvaluator(model, objective, prior=prior)
+    solver = hydra.utils.instantiate(cfg.solver, cost=cost)
+    return swm.policy.WorldModelPolicy(
+        solver=solver,
+        config=swm.PlanConfig(**cfg.plan_config),
+        process=process,
+        transform=transform,
+        history_keys=history_keys,
+    )
 
 
 def img_transform(cfg, dtype=torch.float32):
@@ -166,7 +212,7 @@ def run(cfg: DictConfig):
 
     if policy != 'random':
         print('[eval] loading model checkpoint...', flush=True)
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+        model = swm.wm.utils.load_pretrained(cfg.get('bc_prior') or cfg.policy)
         print('[eval] moving model to planning device...', flush=True)
         if cfg.get('bf16', False):
             model = model.to(torch.bfloat16)
@@ -174,23 +220,18 @@ def run(cfg: DictConfig):
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
+        dynamics = model.world_model if isinstance(model, LeWMGCBC) else model
         if cfg.get('compile', False):
             encoder_attr = (
-                'backbone' if hasattr(model, 'backbone') else 'encoder'
+                'backbone' if hasattr(dynamics, 'backbone') else 'encoder'
             )
             setattr(
-                model,
+                dynamics,
                 encoder_attr,
-                torch.compile(getattr(model, encoder_attr)),
+                torch.compile(getattr(dynamics, encoder_attr)),
             )
-            model.predictor = torch.compile(model.predictor)
-        config = swm.PlanConfig(**cfg.plan_config)
-        objective = hydra.utils.instantiate(cfg.objective)
-        cost = swm.planning.ShootingCostEvaluator(model, objective)
-        solver = hydra.utils.instantiate(cfg.solver, cost=cost)
-        policy = swm.policy.WorldModelPolicy(
-            solver=solver, config=config, process=process, transform=transform
-        )
+            dynamics.predictor = torch.compile(dynamics.predictor)
+        policy = make_policy(cfg, model, process, transform)
 
     else:
         policy = swm.policy.RandomPolicy()

@@ -107,10 +107,8 @@ class ShootingCostEvaluator(torch.nn.Module):
     so ``parameters()`` reaches the real model and solvers (CEM/GD) infer the
     candidate dtype from it instead of falling back to float32.
 
-    The actor warm-start tail-fill — a solver calling ``model.get_action`` for
-    ``Actionable`` models such as tdmpc2 — is not forwarded through the wrapper;
-    it is moot for the ``LeWM``-style models this targets. Add ``get_action``
-    delegation if an ``Actionable`` model is ever wrapped.
+    An optional BC prior supplies block proposals through the existing solver
+    warm-start interface. Without a prior, initialization stays unchanged.
 
     Args:
         model: World model providing ``encode``/``rollout`` (the ``Dynamics``
@@ -125,6 +123,8 @@ class ShootingCostEvaluator(torch.nn.Module):
         encode_goal: Optional ``fn(model, info_dict) -> goal_emb`` to override
             the default goal encoding. Set to ``None`` on the call to skip goal
             encoding entirely (e.g. when the caller pre-populates ``goal_emb``).
+        prior: Optional LeWM GCBC prior supplying ``plan`` block proposals
+            and normalized action bounds for CEM initialization and scoring.
     """
 
     def __init__(
@@ -134,12 +134,16 @@ class ShootingCostEvaluator(torch.nn.Module):
         constraints: list[Objective] | None = None,
         encode_goal: Callable[[Dynamics, dict], torch.Tensor]
         | None = default_goal_encode,
+        prior: torch.nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.model = model
         self.objective = objective
         self.constraints = constraints
         self.encode_goal = encode_goal
+        self.prior = prior
+        if prior is not None:
+            self.get_action = prior.plan
         if constraints:
             self.get_constraints = self._get_constraints
 
@@ -154,6 +158,11 @@ class ShootingCostEvaluator(torch.nn.Module):
         if self.encode_goal is not None and 'goal_emb' not in info_dict:
             info_dict['goal_emb'] = self.encode_goal(self.model, info_dict)
 
+        if self.prior is not None:
+            # CEM must score and select the same bounded candidates.
+            action_candidates.clamp_(
+                self.prior.action_low, self.prior.action_high
+            )
         info_dict = self.model.rollout(info_dict, action_candidates)
         info_dict['action_candidates'] = action_candidates
         return info_dict

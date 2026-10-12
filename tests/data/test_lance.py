@@ -11,6 +11,8 @@ import pytest
 
 import lancedb
 import pyarrow as pa
+import torch
+from torch.utils.data import DataLoader, Subset
 
 from stable_worldmodel.data import (
     EPISODE_DATA_KEY,
@@ -22,6 +24,7 @@ from stable_worldmodel.data import (
     get_format,
     list_formats,
 )
+from stable_worldmodel.data.goal_lance import BatchedGoalLanceDataset
 
 
 def _write_demo(
@@ -374,6 +377,60 @@ def test_getitems_batched(tmp_path):
         np.testing.assert_allclose(
             batch[i]['proprio'].numpy(), single['proprio'].numpy()
         )
+
+
+@pytest.mark.parametrize('cached', [[], ['action', 'proprio']])
+@pytest.mark.parametrize(
+    'probabilities',
+    [
+        (0.0, 0.5, 0.5, 0.0),
+        (0.3, 0.5, 0.0, 0.2),
+        (0.0, 0.0, 0.0, 1.0),
+    ],
+)
+def test_goal_batch_matches_scalar_reads(
+    tmp_path, monkeypatch, cached, probabilities
+):
+    out = tmp_path / 'demo.lance'
+    _write_demo(out, ep_lengths=(25, 20, 30))
+    ds = BatchedGoalLanceDataset(
+        out, frameskip=5, num_steps=2, keys_to_cache=cached
+    )
+    ds.transform = lambda sample: {
+        key: value.float() + 1 for key, value in sample.items()
+    }
+    goals = GoalDataset(
+        ds, goal_probabilities=probabilities, gamma=0.8, seed=17
+    )
+    indices = [len(goals) - 1, 0, 5, 0, 15, -1]
+    reference = [goals[idx] for idx in indices]
+    goals.rng = np.random.default_rng(17)
+    fetched, decoded = [], []
+    fetch_rows = ds._fetch_rows
+    decode_images = ds._decode_images
+
+    def fetch(rows):
+        fetched.append(rows)
+        return fetch_rows(rows)
+
+    def decode(blobs):
+        decoded.append(len(blobs))
+        return decode_images(blobs)
+
+    monkeypatch.setattr(ds, '_fetch_rows', fetch)
+    monkeypatch.setattr(ds, '_decode_images', decode)
+    batch = next(
+        iter(DataLoader(Subset(goals, indices), batch_size=len(indices)))
+    )
+    for key in reference[0]:
+        torch.testing.assert_close(
+            batch[key], torch.stack([item[key] for item in reference])
+        )
+    assert batch['action'].shape == (len(indices), 2, 10)
+    assert batch['goal_pixels'].shape == (len(indices), 1, 3, 8, 8)
+    assert len(fetched) == 1
+    assert len(decoded) == 1 and decoded[0] <= len(indices) * 3
+    assert goals.__getitems__([]) == []
 
 
 def test_get_col_and_row(tmp_path):
