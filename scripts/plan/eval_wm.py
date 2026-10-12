@@ -217,7 +217,7 @@ def run(cfg: DictConfig):
     results_path.mkdir(parents=True, exist_ok=True)
     print(
         f'[eval] saving videos to {results_path.resolve()} '
-        '(one env_{i}.mp4 per env)'
+        '(videos follow the seed order in the results)'
     )
 
     autocast_ctx = torch.autocast(

@@ -653,24 +653,39 @@ class TestExtractInitGoal:
 
 
 class TestEvaluateFromDataset:
-    def test_results_follow_seed_order(self):
+    def test_results_follow_seed_order(self, monkeypatch, tmp_path):
+        def save_panels(video, panels):
+            for index, frames in enumerate(panels['dataset']):
+                (video / f'env_{index}.mp4').write_text(
+                    str(int(frames[0, 0, 0, 0]))
+                )
+
+        monkeypatch.setattr(
+            'stable_worldmodel.world.world.save_panel_videos', save_panels
+        )
         world = _make_world_with(
             [lambda: DatasetResetEnv(1), lambda: DatasetResetEnv(3)]
         )
         results = world.evaluate(
             dataset=FakeEvalDataset(),
             episodes_idx=[1, 0],
-            start_steps=[0, 0],
+            start_steps=[1, 2],
             goal_offset=3,
             eval_budget=1,
+            video=tmp_path,
         )
 
         assert results['seeds'] == [100, 101]
+        assert results['start_steps'] == [2, 1]
+        assert results['goal_steps'] == [5, 4]
+        assert results['goal_step_distances'] == [3, 3]
         np.testing.assert_array_equal(
             results['episode_successes'], [False, True]
         )
         assert results['episode_successes'].dtype == np.bool_
         assert results['success_rate'] == 50.0
+        assert (tmp_path / 'env_0.mp4').read_text() == '1'
+        assert (tmp_path / 'env_1.mp4').read_text() == '2'
 
     def test_method_path_receives_rows(self):
         world = _make_world_with(

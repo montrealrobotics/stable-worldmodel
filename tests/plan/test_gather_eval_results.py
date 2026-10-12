@@ -1,6 +1,7 @@
 """Evaluation reports preserve run settings and select classified videos."""
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -107,12 +108,19 @@ def test_report_embeds_videos_and_keeps_metrics_and_config(
     report = output.read_text()
     assert '| 50.00 |' in report
     assert '[Shared parameters](results_shared_parameters.md)' in report
+    assert evaluation.source.name not in report
+    assert '| Run 1 — cube_one |' in report
     assert '### Configuration' not in report
     assert 'num_samples: 128' not in report
     shared = output.with_name('results_shared_parameters.md').read_text()
     assert '| solver.num_samples | 128 |' in shared
     assert '| policy | models/checkpoint.pt |' in shared
     assert '[Back to evaluation results](results.md)' in shared
+    assert re.findall(r'(?<!!)\[[^\]\n]+\]\(([^\n]+)\)', report + shared) == [
+        'results_shared_parameters.md',
+        'results.md',
+    ]
+    assert str(tmp_path) not in report + shared
     assert 'evaluation_time: 1.5 seconds' in report
     video_root = (
         'results_videos/run_001' if copy_videos else '../inputs/cube_one'
@@ -121,7 +129,6 @@ def test_report_embeds_videos_and_keeps_metrics_and_config(
     assert report.count('<video controls width="640" preload="none">') == 4
     assert report.count('</video>') == 4
     assert f'<source src="{video_url}" type="video/mp4">' in report
-    assert f'[Open Success 1]({video_url})' in report
     copied = list(output.parent.rglob('*.mp4'))
     assert len(copied) == (4 if copy_videos else 0)
     assert all(path.read_bytes() == b'video' for path in copied)
@@ -139,6 +146,8 @@ def test_report_compares_differing_important_settings(tmp_path):
     second.config['subdir'] = 'cube_b'
     first.config['world'] = {'options': {}, 'image_keys': ['pixels', 'goal']}
     second.config['world'] = {'options': {}, 'image_keys': ['pixels', 'goal']}
+    first.config['output'] = {'filename': 'cube_results.txt'}
+    second.config['output'] = {'filename': 'cube_results.txt'}
     output = tmp_path / 'comparison.md'
     write_report([first, second], output, tmp_path, 'cube_')
     report = output.read_text()
@@ -156,6 +165,8 @@ def test_report_compares_differing_important_settings(tmp_path):
     assert 'world.image_keys' in shared
     assert 'eval.start_from_beginning' not in shared
     assert 'solver.num_samples' not in shared
+    assert 'output.filename' not in report + shared
+    assert 'cube_results.txt' not in report + shared
 
 
 def test_shared_report_handles_no_common_settings(tmp_path):
@@ -196,6 +207,8 @@ def test_cli_skips_bad_results_and_reports_missing_videos(tmp_path):
     assert 'Only 0 of 2 requested failure videos available.' in report
     assert 'Only 0 of 2 requested success videos available.' in report
     assert 'Skipped result files' in report
+    assert 'cube_bad/cube_results.txt: missing CONFIG / RESULTS' in report
+    assert str(tmp_path) not in report
     assert not (tmp_path / 'results_videos').exists()
 
 
@@ -325,6 +338,12 @@ def test_report_includes_landscapes_and_expert_selection(
     assert '| policy | model.pt |' in shared
     assert 'controller_scale' not in shared
     assert '## Expert-action selection' in shared
+    assert expert_path.name not in report
+    assert re.findall(r'(?<!!)\[[^\]\n]+\]\(([^\n]+)\)', report + shared) == [
+        'results_shared_parameters.md',
+        'results.md',
+    ]
+    assert str(tmp_path) not in report + shared
 
 
 def test_cli_includes_external_expert_diagnostics_and_skips_bad_json(tmp_path):
@@ -370,6 +389,46 @@ def test_cli_includes_external_expert_diagnostics_and_skips_bad_json(tmp_path):
     report = output.read_text()
     assert '## Expert-action selection' in report
     assert 'first 20 of 21 selections' in report
+    assert 'see the full diagnostic results' not in report
     assert 'No saved PNG' not in report
     assert 'bad_landscape' in report
     assert 'warning: skipping' in completed.stderr
+    assert str(tmp_path) not in report
+
+
+@pytest.mark.parametrize(
+    'path_root', ['/network/scratch/user', 'C:\\Users\\researcher', '~/models']
+)
+def test_report_shortens_paths_in_parameters_metrics_and_warnings(
+    tmp_path, path_root
+):
+    first = parse_result(result(tmp_path / 'cube_a'))
+    second = parse_result(result(tmp_path / 'cube_b'))
+    first.config['policy'] = f'{path_root}/model_a/checkpoint.pt'
+    second.config['policy'] = f'{path_root}/model_b/checkpoint.pt'
+    for evaluation in (first, second):
+        evaluation.config['world'] = {
+            'expert_checkpoint': f'{path_root}/expert run/final.pt',
+            'options': {'assets': [f'{path_root}/assets/object.xml']},
+        }
+        evaluation.results_text += (
+            f"\ncheckpoint: '{evaluation.config['policy']}'"
+        )
+    output = tmp_path / 'comparison.md'
+    write_report(
+        [first, second],
+        output,
+        tmp_path,
+        'cube_',
+        warnings=[f"{path_root}/bad/results.txt: missing '{path_root}/data'"],
+    )
+    report = output.read_text()
+    shared = output.with_name('comparison_shared_parameters.md').read_text()
+    assert path_root not in report + shared
+    assert str(tmp_path) not in report + shared
+    assert 'model_a/checkpoint.pt' in report
+    assert 'model_b/checkpoint.pt' in report
+    assert 'expert run/final.pt' in shared
+    assert 'assets/object.xml' in shared
+    assert 'bad/results.txt: missing' in report
+    assert first.config['policy'] == f'{path_root}/model_a/checkpoint.pt'

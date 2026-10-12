@@ -101,6 +101,8 @@ class ExpertCounterEnv(CounterEnv):
             **super()._make_info(terminated),
             'expert_seed': self._seed_val + 1000,
             'expert_requested_seed': self._seed_val,
+            'expert_start_step': self._seed_val % 7,
+            'goal_step_distance': self._seed_val % 3 + 1,
         }
 
 
@@ -412,6 +414,38 @@ class TestNeedsFlush:
 
 
 class TestEvaluate:
+    @pytest.mark.parametrize('mode, episodes', [('wait', 2), ('auto', 5)])
+    @pytest.mark.parametrize('lengths', [(4, 1), (1, 4)])
+    def test_video_indices_follow_seed_order(
+        self, monkeypatch, tmp_path, mode, episodes, lengths
+    ):
+        world = _make_world(num_envs=2)
+        world.envs = EnvPool(
+            [lambda steps=steps: CounterEnv(steps) for steps in lengths]
+        )
+        world.set_policy(RecordingPolicy())
+        for env in world.envs.envs:
+            env.render_video = lambda env=env: np.full(
+                (3, 3, 3), env._seed_val, dtype=np.uint8
+            )
+
+        def save_seed(path, frames):
+            path.write_text(str(int(frames[0][0, 0, 0])))
+
+        monkeypatch.setattr(
+            'stable_worldmodel.world.world.save_video', save_seed
+        )
+        results = world.evaluate(
+            episodes=episodes, seed=10, reset_mode=mode, video=tmp_path
+        )
+
+        np.testing.assert_array_equal(
+            results['seeds'], np.arange(10, 10 + episodes)
+        )
+        for index, seed in enumerate(results['seeds']):
+            assert (tmp_path / f'episode_{index}.mp4').read_text() == str(seed)
+        assert not list(tmp_path.glob('.video-order-*'))
+
     @pytest.mark.parametrize('custom_video', [False, True])
     def test_video_renderer_preserves_policy_pixels(
         self, monkeypatch, tmp_path, custom_video
@@ -454,6 +488,8 @@ class TestEvaluate:
         assert 'seeds' in results
         assert len(results['episode_successes']) == 4
         assert 'expert_seeds' not in results
+        assert 'start_steps' not in results
+        assert 'goal_steps' not in results
 
     @pytest.mark.parametrize('mode', ['auto', 'wait'])
     def test_evaluate_records_accepted_expert_seeds(self, mode):
@@ -485,6 +521,13 @@ class TestEvaluate:
         np.testing.assert_array_equal(results['seeds'], requested)
         assert results['expert_requested_seeds'] == requested
         assert results['expert_seeds'] == [1000 - seed for seed in requested]
+        starts = [seed % 7 for seed in requested]
+        distances = [seed % 3 + 1 for seed in requested]
+        assert results['start_steps'] == starts
+        assert results['goal_step_distances'] == distances
+        assert results['goal_steps'] == [
+            start + distance for start, distance in zip(starts, distances)
+        ]
         np.testing.assert_array_equal(
             results['episode_successes'], [seed % 2 == 0 for seed in requested]
         )
@@ -530,6 +573,14 @@ class TestEvaluate:
         accepted = [seed + 1000 for seed in requested]
         assert f"'expert_requested_seeds': {requested}" in saved
         assert f"'expert_seeds': {accepted}" in saved
+        starts = [seed % 7 for seed in requested]
+        distances = [seed % 3 + 1 for seed in requested]
+        goals = [
+            start + distance for start, distance in zip(starts, distances)
+        ]
+        assert f"'start_steps': {starts}" in saved
+        assert f"'goal_step_distances': {distances}" in saved
+        assert f"'goal_steps': {goals}" in saved
         assert not (tmp_path / 'results_seeds.json').exists()
 
     def test_evaluate_default_mode_is_auto(self):

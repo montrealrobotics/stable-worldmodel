@@ -40,6 +40,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import gymnasium as gym
@@ -53,6 +54,23 @@ from ..wrapper import MegaWrapper
 from .env_pool import EnvPool
 
 RESET_MODES = ('auto', 'wait')
+
+
+def _reorder_videos(video, prefix, order):
+    """Align video indices with sorted metrics without overwriting a source."""
+    video = Path(video)
+    if not video.is_dir() or np.array_equal(order, np.arange(len(order))):
+        return
+    with TemporaryDirectory(dir=video, prefix='.video-order-') as temporary:
+        staged = []
+        for new_index, old_index in enumerate(order):
+            source = video / f'{prefix}_{old_index}.mp4'
+            if source.is_file():
+                target = Path(temporary) / f'{prefix}_{new_index}.mp4'
+                source.rename(target)
+                staged.append(target)
+        for source in staged:
+            source.rename(video / source.name)
 
 
 def _make_env(
@@ -243,8 +261,13 @@ class World:
             Episodic evaluations also include ``'expert_seeds'`` and
             ``'expert_requested_seeds'`` when provided by the environment,
             recording accepted expert rollout seeds and original requests.
+            Dataset evaluations and environments providing expert step
+            metadata include ``'start_steps'``, ``'goal_steps'``, and
+            ``'goal_step_distances'`` (goal minus start). Step indices refer
+            to the original dataset or expert trajectory.
             Per-episode values are ordered by reset seed in ascending order
             when seeds are available, preserving ties in their original order.
+            Saved video indices follow the same order as these values.
         """
         if dataset is not None:
             mode = reset_mode or 'wait'
@@ -269,6 +292,9 @@ class World:
                 'seeds',
                 'expert_seeds',
                 'expert_requested_seeds',
+                'start_steps',
+                'goal_steps',
+                'goal_step_distances',
             ):
                 if key in results:
                     values = results[key]
@@ -277,6 +303,9 @@ class World:
                         if isinstance(values, np.ndarray)
                         else [values[i] for i in order]
                     )
+            if video:
+                prefix = 'env' if dataset is not None else 'episode'
+                _reorder_videos(video, prefix, order)
         return results
 
     def collect(
@@ -533,12 +562,25 @@ class World:
             for info_key, result_key in (
                 ('expert_seed', 'expert_seeds'),
                 ('expert_requested_seed', 'expert_requested_seeds'),
+                ('expert_start_step', 'start_steps'),
+                ('goal_step_distance', 'goal_step_distances'),
             ):
                 if info_key in world.infos:
                     values = results.setdefault(result_key, [None] * episodes)
                     values[ep_idx] = int(
                         np.asarray(world.infos[info_key][env_idx]).item()
                     )
+            if (
+                'expert_start_step' in world.infos
+                and 'goal_step_distance' in world.infos
+            ):
+                goal_steps = results.setdefault(
+                    'goal_steps', [None] * episodes
+                )
+                goal_steps[ep_idx] = (
+                    results['start_steps'][ep_idx]
+                    + results['goal_step_distances'][ep_idx]
+                )
             if frames is not None:
                 save_video(
                     Path(video) / f'episode_{ep_idx}.mp4',
@@ -651,6 +693,11 @@ class World:
             'success_rate': 0.0,
             'episode_successes': np.zeros(n, dtype=bool),
             'seeds': seeds,
+            'start_steps': [int(step) for step in start_steps],
+            'goal_steps': [
+                int(step) + int(goal_offset) for step in start_steps
+            ],
+            'goal_step_distances': [int(goal_offset)] * n,
         }
         frames: dict[int, list] = defaultdict(list) if video else None
 

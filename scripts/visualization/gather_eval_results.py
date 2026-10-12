@@ -11,7 +11,8 @@ copies up to two success and two failure videos per evaluation beside the
 report. Shared settings go into a linked *_shared_parameters.md file; the
 main report compares differing model, planning, and evaluation parameters.
 Add --landscape-dir and --expert-dir to include saved diagnostic experiments.
-Videos use HTML players with fallback links. Requires only PyYAML;
+Reports use run names and short filenames instead of absolute local paths.
+Videos use HTML players. Requires only PyYAML;
 no model, GPU, or video decoder is needed.
 """
 
@@ -25,7 +26,7 @@ import re
 import shutil
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import quote
 
@@ -38,6 +39,13 @@ RECORD = re.compile(
     r'^==== CONFIG ====\s*\n(.*?)^==== RESULTS ====\s*\n(.*?)(?='
     r'^==== CONFIG ====|\Z)',
     re.MULTILINE | re.DOTALL,
+)
+ABSOLUTE_PATH = re.compile(
+    r"""(?<![\w:/\\<])(?:"""
+    r"""(?P<quote>['"])(?P<quoted>(?:/|~[/\\]|[A-Za-z]:[/\\])"""
+    r"""[^'"\n]*)(?P=quote)|"""
+    r"""(?P<bare>(?:/|~[/\\]|[A-Za-z]:[/\\])"""
+    r"""[^\s'"`<>\[\]{},;|()]+))"""
 )
 
 
@@ -142,9 +150,36 @@ def select_videos(evaluation: Evaluation) -> dict[bool, list[Path]]:
     return selected
 
 
+def short_path(value: str) -> str:
+    """Keep the parent name and filename, omitting machine-specific roots."""
+    path = (
+        PureWindowsPath(value)
+        if re.match(r'[A-Za-z]:[/\\]', value)
+        else Path(value)
+    )
+    parts = [part for part in path.parts if part not in {path.anchor, '~'}]
+    return '/'.join(parts[-2:])
+
+
+def portable_text(value: str) -> str:
+    """Shorten absolute paths embedded in parameter values or diagnostics."""
+
+    def shorten(match: re.Match[str]) -> str:
+        raw = match['quoted'] or match['bare']
+        delimiter = match['quote'] or ''
+        return f'{delimiter}{short_path(raw)}{delimiter}'
+
+    return ABSOLUTE_PATH.sub(shorten, value)
+
+
 def cell(value: Any) -> str:
+    text = str(value)
+    if isinstance(value, (str, Path)) and (
+        text.startswith(('/', '~/')) or re.match(r'[A-Za-z]:[/\\]', text)
+    ):
+        text = short_path(text)
     return (
-        str(value)
+        portable_text(text)
         .replace('&', '&amp;')
         .replace('<', '&lt;')
         .replace('>', '&gt;')
@@ -209,10 +244,6 @@ def relative_url(path: Path, output: Path) -> str:
     return quote(Path(relative).as_posix(), safe='/.')
 
 
-def link(path: Path, output: Path, label: str) -> str:
-    return f'[{label}]({relative_url(path, output)})'
-
-
 def experiment_files(directories: list[Path], name: str) -> list[Path]:
     """Accept individual experiment directories or trees of experiments."""
     return sorted(
@@ -261,7 +292,8 @@ def experiment_section(
     shared = {
         key: configs[0][key]
         for key in keys
-        if all(key in config for config in configs)
+        if key != 'output.filename'
+        and all(key in config for config in configs)
         and all(config[key] == configs[0][key] for config in configs[1:])
     }
     differing = [
@@ -299,7 +331,7 @@ def experiment_section(
         ]
     )
     for (path, data), config in zip(rows, configs):
-        values = [link(path, output, cell(path.parent.name))]
+        values = [cell(path.parent.name)]
         values.extend(cell(data.get(key, '—')) for key in metric_keys)
         values.extend(cell(config.get(key, '—')) for key in differing)
         lines.append('| ' + ' | '.join(values) + ' |')
@@ -308,8 +340,6 @@ def experiment_section(
             [
                 '',
                 f'### {cell(path.parent.name)}',
-                '',
-                link(path, output, 'Full diagnostic results'),
                 '',
             ]
         )
@@ -339,10 +369,6 @@ def experiment_section(
                             '<video controls width="640" preload="none">',
                             f'  <source src="{relative_url(target, output)}" type="video/mp4">',
                             '</video>',
-                            '',
-                            link(
-                                target, output, 'Open action/goal comparison'
-                            ),
                             '',
                         ]
                     )
@@ -421,8 +447,6 @@ def experiment_section(
                         f'  <source src="{relative_url(target, output)}" type="video/mp4">',
                         '</video>',
                         '',
-                        link(target, output, 'Open comparison'),
-                        '',
                     ]
                 )
                 outcomes = comparison.get('outcomes', {})
@@ -466,8 +490,7 @@ def experiment_section(
                         [
                             (
                                 f'Showing the first 20 of {len(selections)} '
-                                'selections; see the full diagnostic results '
-                                'for all selections.'
+                                'selections.'
                             ),
                             '',
                         ]
@@ -530,7 +553,8 @@ def write_report(
     shared = {
         key: configs[0][key]
         for key in keys
-        if all(key in config for config in configs)
+        if key != 'output.filename'
+        and all(key in config for config in configs)
         and all(config[key] == configs[0][key] for config in configs[1:])
     }
     differing = [
@@ -545,7 +569,7 @@ def write_report(
             'evaluations.'
         ),
         '',
-        link(output, shared_path, 'Back to evaluation results'),
+        f'[Back to evaluation results]({relative_url(output, shared_path)})',
         '',
     ]
     if shared:
@@ -559,15 +583,15 @@ def write_report(
     lines = [
         '# Evaluation results',
         '',
-        f'Searched `{root}` for directory names starting with `{prefix}`.',
+        f'Evaluation directory names start with `{prefix}`.',
         '',
         (
-            'Success rates are percentages. Each result file uses its latest '
-            'appended evaluation. Videos are selected in filename order '
+            'Success rates are percentages. Each run shows its latest '
+            'evaluation. Videos are selected in filename order '
             '(up to two per outcome).'
         ),
         '',
-        link(shared_path, output, 'Shared parameters'),
+        f'[Shared parameters]({relative_url(shared_path, output)})',
         '',
         (
             'Only differing model, planning, and evaluation settings are shown '
@@ -580,7 +604,7 @@ def write_report(
     for index, (evaluation, config) in enumerate(zip(evaluations, configs), 1):
         name = evaluation.source.parent.relative_to(root).as_posix()
         values = [
-            f'[Run {index}](#run-{index}) — {cell(name)}',
+            f'Run {index} — {cell(name)}',
             f'{evaluation.success_rate:.2f}',
             *(cell(config.get(key, '—')) for key in differing),
         ]
@@ -591,8 +615,6 @@ def write_report(
             [
                 '',
                 f'## Run {index}',
-                '',
-                f'Source: {link(evaluation.source, output, "result file")}',
                 '',
             ]
         )
@@ -634,8 +656,6 @@ def write_report(
                         '  Your viewer does not support embedded video.',
                         '</video>',
                         '',
-                        link(target, output, f'Open {label} {video_index}'),
-                        '',
                     ]
                 )
             if len(videos[success]) < 2:
@@ -650,7 +670,7 @@ def write_report(
                 '### Metrics',
                 '',
                 '```text',
-                evaluation.results_text,
+                portable_text(evaluation.results_text),
                 '```',
             ]
         )
@@ -682,7 +702,9 @@ def write_report(
     shared_path.write_text('\n'.join(shared_lines) + '\n', encoding='utf-8')
     if warnings:
         lines.extend(['', '## Skipped result files', ''])
-        lines.extend(f'- {cell(warning)}' for warning in warnings)
+        lines.extend(
+            f'- {cell(portable_text(warning))}' for warning in warnings
+        )
     output.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
