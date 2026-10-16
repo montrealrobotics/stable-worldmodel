@@ -298,6 +298,10 @@ def run(cfg):
     val_cfg = {**cfg.loader}
     val_cfg['shuffle'] = False
     val_cfg['drop_last'] = False
+    val_cfg['num_workers'] = cfg.get('val_num_workers', val_cfg['num_workers'])
+    if val_cfg['num_workers'] == 0:
+        val_cfg.pop('persistent_workers', None)
+        val_cfg.pop('prefetch_factor', None)
     val = torch.utils.data.DataLoader(val_set, **val_cfg)
 
     ##############################
@@ -327,7 +331,9 @@ def run(cfg):
             'optimizer': dict(cfg.optimizer),
             'scheduler': {
                 'type': 'LinearWarmupCosineAnnealingLR',
-                'warmup_steps': max(1, int(0.01 * total_steps)),
+                'warmup_steps': max(
+                    1, int(cfg.get('warmup_ratio', 0.01) * total_steps)
+                ),
                 'max_steps': total_steps,
             },
             'interval': 'epoch',

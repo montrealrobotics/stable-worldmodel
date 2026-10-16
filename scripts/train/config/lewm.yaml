@@ -9,6 +9,8 @@ output_model_name: lewm
 ckpt_path: null
 
 num_workers: 6
+# Validation runs rarely; persistent workers otherwise sit idle holding RAM.
+val_num_workers: 4
 train_split: 0.9
 seed: 3072
 img_size: 224
@@ -43,6 +45,8 @@ optimizer:
   type: AdamW
   lr: 5e-5
   weight_decay: 1e-3
+# Fraction of total training steps spent in linear LR warmup.
+warmup_ratio: 0.01
 
 wm:
   history_size: 3
