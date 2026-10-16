@@ -9,13 +9,16 @@ def encoder_gradient_diagnostics(
     parameters: Iterable[torch.nn.Parameter],
     sigreg_weight: float,
     eps: float = 1e-8,
+    search_loss: torch.Tensor | None = None,
+    search_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Compare unscaled loss gradients without changing parameter ``.grad``.
 
     Retain the forward graph for the usual backward pass. Unused parameters
-    contribute zeros at their original positions in both gradient vectors.
+    contribute zeros at their original positions in all gradient vectors.
     Reduce in FP32 outside autocast, including when training uses FP16/BF16.
-    A zero norm gives a cosine similarity of zero.
+    A zero norm gives a cosine similarity of zero. When ``search_loss`` is
+    given, also compare its gradient against the prediction and SIGReg ones.
     """
     parameters = tuple(p for p in parameters if p.requires_grad)
 
@@ -31,37 +34,55 @@ def encoder_gradient_diagnostics(
         )
 
     # Use the original losses, before Lightning's backward loss scaling.
-    pred_grads = gradients(pred_loss)
-    sigreg_grads = gradients(sigreg_loss)
+    losses = {'pred': pred_loss, 'sigreg': sigreg_loss}
+    if search_loss is not None:
+        losses['search'] = search_loss
+    grads = {k: gradients(v) for k, v in losses.items()}
+    names = list(grads)
+    pairs = [(a, b) for i, a in enumerate(names) for b in names[i + 1 :]]
     with (
         torch.no_grad(),
         torch.autocast(device_type=pred_loss.device.type, enabled=False),
     ):
-        pred_sq = pred_loss.new_zeros((), dtype=torch.float32)
-        sigreg_sq = torch.zeros_like(pred_sq)
-        dot = torch.zeros_like(pred_sq)
-        for pred_grad, sigreg_grad in zip(pred_grads, sigreg_grads):
-            if pred_grad is not None:
-                pred_grad = pred_grad.float()
-                pred_sq += pred_grad.square().sum()
-            if sigreg_grad is not None:
-                sigreg_grad = sigreg_grad.float()
-                sigreg_sq += sigreg_grad.square().sum()
-            if pred_grad is not None and sigreg_grad is not None:
-                dot += (pred_grad * sigreg_grad).sum()
+        zero = pred_loss.new_zeros((), dtype=torch.float32)
+        sq = {k: zero.clone() for k in names}
+        dot = {pair: zero.clone() for pair in pairs}
+        for per_param in zip(*grads.values()):
+            g = {
+                k: v.float() for k, v in zip(names, per_param) if v is not None
+            }
+            for k, v in g.items():
+                sq[k] += v.square().sum()
+            for a, b in pairs:
+                if a in g and b in g:
+                    dot[a, b] += (g[a] * g[b]).sum()
 
-        pred_norm = pred_sq.sqrt()
-        sigreg_norm = sigreg_sq.sqrt()
-        norm_product = pred_norm * sigreg_norm
-        denominator = torch.where(
-            norm_product > 0, norm_product, torch.ones_like(norm_product)
-        )
-        cosine = (dot / denominator).clamp(-1, 1)
-        return {
-            'pred_grad_norm': pred_norm,
-            'sigreg_grad_norm': sigreg_norm,
+        norm = {k: v.sqrt() for k, v in sq.items()}
+
+        def cosine(a, b):
+            product = norm[a] * norm[b]
+            denominator = torch.where(
+                product > 0, product, torch.ones_like(product)
+            )
+            return (dot[a, b] / denominator).clamp(-1, 1)
+
+        metrics = {
+            'pred_grad_norm': norm['pred'],
+            'sigreg_grad_norm': norm['sigreg'],
             'relative_grad_magnitude': (
-                sigreg_weight * sigreg_norm / (pred_norm + eps)
+                sigreg_weight * norm['sigreg'] / (norm['pred'] + eps)
             ),
-            'grad_cosine_similarity': cosine,
+            'grad_cosine_similarity': cosine('pred', 'sigreg'),
         }
+        if search_loss is not None:
+            metrics |= {
+                'search_grad_norm': norm['search'],
+                'search_relative_grad_magnitude': (
+                    search_weight * norm['search'] / (norm['pred'] + eps)
+                ),
+                'search_pred_grad_cosine_similarity': cosine('pred', 'search'),
+                'search_sigreg_grad_cosine_similarity': cosine(
+                    'sigreg', 'search'
+                ),
+            }
+        return metrics

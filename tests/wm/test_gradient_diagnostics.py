@@ -196,3 +196,31 @@ def test_training_logging_schedule_and_optimizer_parity(
 
     for disabled, enabled in zip(*results):
         torch.testing.assert_close(disabled, enabled, rtol=0, atol=0)
+
+
+def test_search_loss_gradient_metrics():
+    parameter = nn.Parameter(torch.ones(2))
+    pred_loss = (parameter * torch.tensor([3.0, 4.0])).sum()
+    sigreg_loss = (parameter * torch.tensor([-4.0, 3.0])).sum()
+    search_loss = (parameter * torch.tensor([0.0, 10.0])).sum()
+    metrics = encoder_gradient_diagnostics(
+        pred_loss,
+        sigreg_loss,
+        [parameter],
+        sigreg_weight=0.2,
+        search_loss=search_loss,
+        search_weight=0.5,
+    )
+
+    assert metrics['search_grad_norm'].item() == pytest.approx(10.0)
+    assert metrics['search_relative_grad_magnitude'].item() == pytest.approx(
+        0.5 * 10.0 / 5.0
+    )
+    assert metrics[
+        'search_pred_grad_cosine_similarity'
+    ].item() == pytest.approx(0.8)
+    assert metrics[
+        'search_sigreg_grad_cosine_similarity'
+    ].item() == pytest.approx(0.6)
+    assert metrics['grad_cosine_similarity'].item() == pytest.approx(0.0)
+    assert parameter.grad is None

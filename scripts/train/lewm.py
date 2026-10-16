@@ -229,6 +229,8 @@ def lejepa_forward(self, batch, stage, cfg):
                 output['sigreg_loss'],
                 self.model.encoder.parameters(),
                 lambd,
+                search_loss=output.get('search_loss'),
+                search_weight=search.weight if search else 0.0,
             )
             self.log_dict(
                 {f'{stage}/{k}': v for k, v in diagnostics.items()},
