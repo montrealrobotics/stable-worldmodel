@@ -378,10 +378,9 @@ class PushTSWMEnv(gym.Env):
         self._goal_pose = torch.as_tensor(poses[index], device=base.device)[
             None
         ]
-        if self.goal_eef_position_tolerance is not None:
-            self._goal_eef_position = torch.as_tensor(
-                eef_positions[index], device=base.device
-            )[None]
+        self._goal_eef_position = torch.as_tensor(
+            eef_positions[index], device=base.device
+        )[None]
         self._expert_metadata = {
             'goal_step_distance': index - start_index,
             'expert_start_step': start_index,
@@ -474,23 +473,27 @@ class PushTSWMEnv(gym.Env):
         return obs, info
 
     def _goal_errors(self, base=None):
-        """Measure object XY/yaw and optional end-effector XYZ goal errors."""
+        """Measure T XY/yaw and EEF XYZ errors; EEF is NaN without a target."""
         if base is None:
             base = self.env.unwrapped
         pose = base.tee.pose
+        goal_pose = (
+            base.goal_tee.pose.raw_pose
+            if self._goal_pose is None
+            else self._goal_pose
+        )
         xy_error = torch.linalg.vector_norm(
-            pose.p[:, :2] - self._goal_pose[:, :2], dim=-1
+            pose.p[:, :2] - goal_pose[:, :2], dim=-1
         )
-        yaw_error = quaternion_yaw(pose.q) - quaternion_yaw(
-            self._goal_pose[:, 3:]
-        )
+        yaw_error = quaternion_yaw(pose.q) - quaternion_yaw(goal_pose[:, 3:])
         # Wrap the angle difference to [-pi, pi] before taking its magnitude.
         yaw_error = torch.atan2(yaw_error.sin(), yaw_error.cos()).abs()
         errors = {
             'xy_error_m': float(xy_error.item()),
             'yaw_error_rad': float(yaw_error.item()),
+            'eef_position_error_m': float('nan'),
         }
-        if self.goal_eef_position_tolerance is not None:
+        if self._goal_eef_position is not None:
             eef_error = torch.linalg.vector_norm(
                 base.agent.tcp.pose.p - self._goal_eef_position,
                 dim=-1,
@@ -602,6 +605,7 @@ class PushTSWMEnv(gym.Env):
         options = dict(options or {})
         start_from_beginning = options.pop('start_from_beginning', True)
         self._goal_pose = None
+        self._goal_eef_position = None
         self.goal_observation = None
         self._evaluation_options = copy.deepcopy(options)
         self._executed_actions = []
@@ -619,10 +623,12 @@ class PushTSWMEnv(gym.Env):
         self._pose_trace = []
         if self._expert is not None:
             self._record_pose(False)
+        errors = self._goal_errors()
         return observation, {
+            **errors,
             **self._state_goal_info(),
             'goal': self._goal.copy(),
-            'success': self._goal_reached()
+            'success': self._goal_reached(errors)
             if self._goal_pose is not None
             else bool(single(info['success'])),
             'task_success': bool(single(info['success'])),
@@ -650,8 +656,9 @@ class PushTSWMEnv(gym.Env):
         obs, reward, terminated, truncated, info = self.env.step(batched)
         self._executed_actions.append(action.copy())
         task_success = bool(single(info['success']))
+        errors = self._goal_errors()
         success = (
-            self._goal_reached()
+            self._goal_reached(errors)
             if self._goal_pose is not None
             else task_success
         )
@@ -665,6 +672,7 @@ class PushTSWMEnv(gym.Env):
             success,
             bool(single(truncated)) or (done and not success),
             {
+                **errors,
                 **self._state_goal_info(),
                 'goal': self._goal.copy(),
                 'success': success,

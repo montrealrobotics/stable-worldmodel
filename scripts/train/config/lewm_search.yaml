@@ -1,0 +1,36 @@
+# Search-aware post-training: rank the expert plan above a short CEM's elites.
+defaults:
+  - lewm
+  - _self_
+
+init_from: ??? # pretrained LeWM weights_epoch_N.pt or folder
+output_model_name: lewm_search
+
+data:
+  dataset:
+    num_steps: ${eval:'${wm.history_size} + ${loss.search.horizon}'}
+
+optimizer:
+  lr: 1e-5
+
+trainer:
+  max_steps: 10000
+  # Step-based runs end mid-epoch, so validate on a step schedule instead.
+  val_check_interval: 500
+  limit_val_batches: 50
+
+loader:
+  batch_size: 64
+
+loss:
+  search:
+    weight: 1.0
+    horizon: 5 # planning horizon in action blocks, match eval
+    bptt: true # false: gradients only from the last prediction step
+    cem_steps: 5 # no-grad CEM iterations whose elites become negatives
+    num_samples: 64 # CEM population per iteration
+    topk: 8 # elites per iteration; loss ranks expert vs cem_steps * topk
+    num_perturbed: 16 # expert + Gaussian noise negatives, block shortcut learning
+    perturb_std: 0.5 # noise std in normalized action units
+    var_scale: 1.0 # match solver.var_scale
+    temperature: 1.0 # scale on summed goal MSE

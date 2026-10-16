@@ -231,3 +231,4 @@ CLAUDE.md
 uv.lock
 slurm_scripts/
 small_tests/
+reports/

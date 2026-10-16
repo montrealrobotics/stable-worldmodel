@@ -490,6 +490,8 @@ class TestEvaluate:
         assert 'expert_seeds' not in results
         assert 'start_steps' not in results
         assert 'goal_steps' not in results
+        assert 'episode_xy_error_m' not in results
+        assert 'mean_xy_error_m' not in results
 
     @pytest.mark.parametrize('mode', ['auto', 'wait'])
     def test_evaluate_records_accepted_expert_seeds(self, mode):
@@ -497,6 +499,12 @@ class TestEvaluate:
             def _make_info(self, terminated):
                 info = super()._make_info(terminated)
                 info['expert_seed'] = 1000 - self._seed_val
+                distance = self._seed_val + self._step_count * 10.0
+                info.update(
+                    xy_error_m=distance,
+                    eef_position_error_m=distance * 2,
+                    yaw_error_rad=distance * 3,
+                )
                 return info
 
             def step(self, action):
@@ -532,6 +540,17 @@ class TestEvaluate:
             results['episode_successes'], [seed % 2 == 0 for seed in requested]
         )
         assert results['success_rate'] == 50.0
+        distances = [
+            seed + (3 if seed == 10 else 1) * 10.0 for seed in requested
+        ]
+        for key, scale in (
+            ('xy_error_m', 1),
+            ('eef_position_error_m', 2),
+            ('yaw_error_rad', 3),
+        ):
+            expected = np.asarray(distances) * scale
+            np.testing.assert_allclose(results[f'episode_{key}'], expected)
+            assert results[f'mean_{key}'] == pytest.approx(expected.mean())
 
     def test_eval_script_saves_all_expert_seeds(self, monkeypatch, tmp_path):
         pytest.importorskip('stable_pretraining')

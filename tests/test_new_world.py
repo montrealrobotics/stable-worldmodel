@@ -653,6 +653,49 @@ class TestExtractInitGoal:
 
 
 class TestEvaluateFromDataset:
+    @pytest.mark.parametrize('mode', ['wait', 'auto'])
+    @pytest.mark.parametrize('budget', [2, 4])
+    def test_final_goal_errors_at_completion_or_budget(self, mode, budget):
+        class DistanceEnv(DatasetResetEnv):
+            def _make_info(self, terminated):
+                info = super()._make_info(terminated)
+                distance = self._seed_val + self._step_count * 10.0
+                info.update(
+                    xy_error_m=distance,
+                    eef_position_error_m=distance * 2,
+                    yaw_error_rad=distance * 3,
+                )
+                return info
+
+            def step(self, action):
+                obs, reward, terminated, truncated, info = super().step(action)
+                if terminated and self._seed_val == 101:
+                    terminated, truncated = False, True
+                return obs, reward, terminated, truncated, info
+
+        world = _make_world_with(
+            [lambda: DistanceEnv(1), lambda: DistanceEnv(3)]
+        )
+        results = world.evaluate(
+            dataset=FakeEvalDataset(),
+            episodes_idx=[1, 0],
+            start_steps=[0, 0],
+            goal_offset=3,
+            eval_budget=budget,
+            reset_mode=mode,
+        )
+
+        assert results['seeds'] == [100, 101]
+        distances = np.array([100 + min(budget, 3) * 10, 111])
+        for key, scale in (
+            ('xy_error_m', 1),
+            ('eef_position_error_m', 2),
+            ('yaw_error_rad', 3),
+        ):
+            expected = distances * scale
+            np.testing.assert_allclose(results[f'episode_{key}'], expected)
+            assert results[f'mean_{key}'] == pytest.approx(expected.mean())
+
     def test_results_follow_seed_order(self, monkeypatch, tmp_path):
         def save_panels(video, panels):
             for index, frames in enumerate(panels['dataset']):

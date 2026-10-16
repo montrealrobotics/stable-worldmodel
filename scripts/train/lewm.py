@@ -6,6 +6,7 @@ import hydra
 import lightning as pl
 import stable_pretraining as spt
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
@@ -13,9 +14,15 @@ from stable_pretraining import data as dt
 
 import stable_worldmodel as swm
 from stable_worldmodel.data import column_normalizer as get_column_normalizer
+from stable_worldmodel.planning.objective import GoalMSE
 from stable_worldmodel.wm.diagnostics import encoder_gradient_diagnostics
+from stable_worldmodel.wm.lewm.detached_rollout import detached_rollout
 from stable_worldmodel.wm.loss import SIGReg
-from stable_worldmodel.wm.utils import save_pretrained
+from stable_worldmodel.wm.utils import (
+    _resolve,
+    load_pretrained,
+    save_pretrained,
+)
 
 
 def _vit_embed_dim(scale: str) -> int:
@@ -38,10 +45,14 @@ if not OmegaConf.has_resolver('vit_embed_dim'):
     OmegaConf.register_new_resolver('vit_embed_dim', _vit_embed_dim)
 
 
-def get_img_preprocessor(source: str, target: str, img_size: int = 224):
-    imagenet_stats = dt.dataset_stats.ImageNet
+def get_img_preprocessor(
+    source: str, target: str, img_size: int = 224, uint8: bool = False
+):
+    """uint8=True leaves scaling and normalization to ``normalize_pixels``."""
+    stats = {} if uint8 else dt.dataset_stats.ImageNet
+    dtype = torch.uint8 if uint8 else torch.float32
     to_image = dt.transforms.ToImage(
-        **imagenet_stats, source=source, target=target
+        **stats, dtype=dtype, source=source, target=target
     )
     resize = dt.transforms.Resize(img_size, source=source, target=target)
     return dt.transforms.Compose(to_image, resize)
@@ -76,6 +87,98 @@ class SaveCkptCallback(Callback):
         )
 
 
+def search_loss(model, batch, emb, cfg):
+    """InfoNCE over goal costs: the expert plan must beat a short CEM's elites."""
+    H, search = cfg.wm.history_size, cfg.loss.search
+    T = search.horizon
+    if emb.size(1) < H + T:
+        raise ValueError(f'search loss needs num_steps >= {H + T}')
+    actions = batch['action']
+    B = actions.size(0)
+    expert = actions[:, None, H - 1 : H - 1 + T]
+    goal = emb[:, H - 1 + T, None].detach()
+    skip = ('action', 'emb', 'act_emb')
+    heads = max(
+        (m.heads for m in model.modules() if hasattr(m, 'heads')), default=1
+    )
+
+    def chunk_cost(plans):
+        S = plans.size(1)
+
+        def ctx(v, n=H):
+            return v[:, None, :n].expand(B, S, *v[:, :n].shape[1:])
+
+        info = {
+            k: ctx(v)
+            for k, v in batch.items()
+            if torch.is_tensor(v) and v.ndim > 1 and k not in skip
+        }
+        info['emb'] = ctx(emb)
+        info['action_history'] = ctx(actions, H - 1)
+        if search.bptt or not torch.is_grad_enabled():
+            info = model.rollout(info, plans, H)
+        else:
+            history = torch.cat([info['action_history'], plans], 2)
+            preds = detached_rollout(
+                model, info['emb'].flatten(0, 1), history.flatten(0, 1), T, H
+            )
+            info['predicted_emb'] = preds.unflatten(0, (B, S))
+        info['goal_emb'] = goal
+        return GoalMSE()(info)  # (B, S)
+
+    def cost(plans):
+        # Attention kernels fail past 65535 rollouts * heads (CUDA grid limit).
+        # shortcut: needs B * heads <= 65535, chunk B too if not.
+        step = max(1, 65535 // (heads * B))
+        chunks = plans.split(step, dim=1)
+        return torch.cat([chunk_cost(c) for c in chunks], dim=1)
+
+    # Mirror CEMSolver: start at N(0, var_scale), refit to the top-k each step.
+    mean = torch.zeros_like(expert)
+    std = torch.full_like(expert, search.var_scale)
+    rows = torch.arange(B, device=actions.device)[:, None]
+    elites = []
+    with torch.no_grad():
+        for _ in range(search.cem_steps):
+            plans = mean + std * torch.randn(
+                B,
+                search.num_samples,
+                *expert.shape[2:],
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            plans[:, 0] = mean[:, 0]
+            idx = cost(plans).topk(search.topk, dim=1, largest=False).indices
+            top = plans[rows, idx]
+            elites.append(top)
+            mean = top.mean(1, keepdim=True)
+            std = top.std(1, correction=0, keepdim=True)
+    # Expert-like negatives: action style alone can no longer identify the expert.
+    perturbed = expert + search.get('perturb_std', 0.0) * torch.randn(
+        B,
+        search.get('num_perturbed', 0),
+        *expert.shape[2:],
+        device=actions.device,
+        dtype=actions.dtype,
+    )
+    plans = torch.cat([expert, perturbed, *elites], 1)
+    costs = cost(plans)  # expert at index 0
+    target = costs.new_zeros(B, dtype=torch.long)
+    return F.cross_entropy(-costs.float() / search.temperature, target)
+
+
+def normalize_pixels(batch):
+    """Scale uint8 pixel columns on the GPU, as ToImage would on the CPU."""
+    for key, value in batch.items():
+        if key.startswith('pixels') and value.dtype == torch.uint8:
+            stats = dt.dataset_stats.ImageNet
+            shape = (3, 1, 1)
+            mean = value.new_tensor(stats['mean'], dtype=torch.float32)
+            std = value.new_tensor(stats['std'], dtype=torch.float32)
+            batch[key] = (value / 255.0 - mean.view(shape)) / std.view(shape)
+    return batch
+
+
 def lejepa_forward(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
 
@@ -85,6 +188,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
+    normalize_pixels(batch)
 
     output = self.model.encode(batch)
 
@@ -95,7 +199,7 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_info['emb'] = emb[:, :ctx_len]
     ctx_info['act_emb'] = act_emb[:, :ctx_len]
 
-    tgt_emb = emb[:, n_preds:]  # label
+    tgt_emb = emb[:, n_preds : n_preds + ctx_len]  # label
     pred_emb = self.model.predict(ctx_info)['preds']  # pred
 
     # LeWM loss
@@ -104,6 +208,10 @@ def lejepa_forward(self, batch, stage, cfg):
     reg_emb = output.get('cls_emb', emb)
     output['sigreg_loss'] = self.sigreg(reg_emb.transpose(0, 1))
     output['loss'] = output['pred_loss'] + lambd * output['sigreg_loss']
+    search = getattr(cfg.loss, 'search', None)
+    if search and search.weight > 0:
+        output['search_loss'] = search_loss(self.model, batch, emb, cfg)
+        output['loss'] = output['loss'] + search.weight * output['search_loss']
 
     losses_dict = {
         f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k
@@ -150,7 +258,10 @@ def run(cfg):
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
     transforms = [
-        get_img_preprocessor(source=col, target=col, img_size=cfg.img_size)
+        # uint8 batches: 4x less host-to-GPU copy, normalized in the forward.
+        get_img_preprocessor(
+            source=col, target=col, img_size=cfg.img_size, uint8=True
+        )
         for col in cfg.data.dataset.keys_to_load
         if col.startswith('pixels')
     ]
@@ -191,11 +302,16 @@ def run(cfg):
     ##       model / optim      ##
     ##############################
 
-    model_cfg = cfg.model.copy()
-    with open_dict(model_cfg):
-        compile_model = model_cfg.pop('compile', False)
-    world_model = hydra.utils.instantiate(model_cfg)
-    if compile_model:
+    init_from = cfg.get('init_from')
+    if init_from:
+        # Post-training: keep the pretrained architecture and weights.
+        world_model = load_pretrained(init_from)
+        checkpoint_dir = swm.data.utils.get_cache_dir(sub_folder='checkpoints')
+        with open_dict(cfg):
+            cfg.model = _resolve(init_from, Path(checkpoint_dir))[1]
+    else:
+        world_model = hydra.utils.instantiate(cfg.model)
+    if cfg.get('compile', False):
         world_model.encode = torch.compile(world_model.encode)
         world_model.predict = torch.compile(world_model.predict)
 

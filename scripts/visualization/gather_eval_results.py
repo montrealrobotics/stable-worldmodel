@@ -12,7 +12,8 @@ report. Shared settings go into a linked *_shared_parameters.md file; the
 main report compares differing model, planning, and evaluation parameters.
 Add --landscape-dir and --expert-dir to include saved diagnostic experiments.
 Reports use run names and short filenames instead of absolute local paths.
-Videos use HTML players. Requires only PyYAML;
+Episode errors are compared by expert/eval seed, with mean errors per run.
+Videos use HTML players. Requires PyYAML and matplotlib for error plots;
 no model, GPU, or video decoder is needed.
 """
 
@@ -25,7 +26,7 @@ import os
 import re
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import quote
@@ -47,6 +48,11 @@ ABSOLUTE_PATH = re.compile(
     r"""(?P<bare>(?:/|~[/\\]|[A-Za-z]:[/\\])"""
     r"""[^\s'"`<>\[\]{},;|()]+))"""
 )
+ERROR_METRICS = {
+    'xy_error_m': 'T XY error (m)',
+    'eef_position_error_m': 'EEF position error (m)',
+    'yaw_error_rad': 'T yaw error (rad)',
+}
 
 
 @dataclass
@@ -58,6 +64,35 @@ class Evaluation:
     success_rate: float
     episode_successes: list[bool]
     record_count: int
+    metric_arrays: dict[str, list[int | float]] = field(default_factory=dict)
+    mean_errors: dict[str, float] = field(default_factory=dict)
+
+
+def numeric_array(text: str, key: str) -> list[int | float]:
+    """Read complete numeric lists/NumPy arrays, preserving seed integers."""
+    match = re.search(
+        rf"['\"]{re.escape(key)}['\"]\s*:\s*"
+        r'(?:array\(\s*)?\[([^\]]*)\]',
+        text,
+        re.DOTALL,
+    )
+    if not match:
+        return []
+    tokens = re.split(r'[,\s]+', match.group(1).strip().strip(','))
+    if not tokens or not all(
+        re.fullmatch(NUMBER, token)
+        or token.lower() in {'nan', 'inf', '+inf', '-inf', 'none'}
+        for token in tokens
+    ):
+        return []
+    return [
+        int(token)
+        if re.fullmatch(r'[-+]?\d+', token)
+        else float('nan')
+        if token.lower() == 'none'
+        else float(token)
+        for token in tokens
+    ]
 
 
 def parse_result(path: Path) -> Evaluation:
@@ -102,6 +137,28 @@ def parse_result(path: Path) -> Evaluation:
                 or (token.lower() != 'false' and float(token) == 1)
                 for token in tokens
             ]
+    arrays = {
+        key: numeric_array(results_text, key)
+        for key in (
+            'seeds',
+            'expert_seeds',
+            'start_steps',
+            'goal_steps',
+            *(f'episode_{key}' for key in ERROR_METRICS),
+        )
+        if re.search(rf"['\"]{key}['\"]\s*:", results_text)
+    }
+    means = {}
+    for key in ERROR_METRICS:
+        match = re.search(
+            rf"['\"]mean_{key}['\"]\s*:\s*"
+            rf'(?:np\.float(?:32|64)\()?({NUMBER}|nan|[-+]?inf)'
+            r'\)?(?=\s*[,}])',
+            results_text,
+            re.IGNORECASE,
+        )
+        if match:
+            means[key] = float(match.group(1))
     return Evaluation(
         path,
         config,
@@ -110,6 +167,8 @@ def parse_result(path: Path) -> Evaluation:
         rate,
         outcomes,
         len(records),
+        arrays,
+        means,
     )
 
 
@@ -536,6 +595,144 @@ def experiment_section(
     return lines, common
 
 
+def error_plots(evaluations: list[Evaluation], output: Path) -> list[str]:
+    """Compare final episode errors on matching seeds and saved run means."""
+    metrics = [
+        key
+        for key in ERROR_METRICS
+        if any(
+            f'episode_{key}' in evaluation.metric_arrays
+            or key in evaluation.mean_errors
+            for evaluation in evaluations
+        )
+    ]
+    if not metrics:
+        return []
+    import matplotlib
+
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    lines = [
+        '',
+        '## Error comparison',
+        '',
+        (
+            'Episode plots compare final goal errors; lower is better. '
+            'The x-axis shows the evaluation seed, followed by the expert '
+            'seed only when it differs. Episodes are matched using both '
+            'seeds and saved start/goal steps. '
+            'Mean plots use the saved mean across each run’s episodes. '
+            'Missing/nonfinite values are omitted; runs without complete '
+            'seed arrays are omitted from episode plots.'
+        ),
+        '',
+    ]
+    figure_dir = output.parent / f'{output.stem}_figures'
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    for key in metrics:
+        series = []
+        for evaluation in evaluations:
+            arrays = evaluation.metric_arrays
+            errors = arrays.get(f'episode_{key}', [])
+            seeds = arrays.get('seeds', [])
+            metadata = [
+                arrays.get(name, [None] * len(errors))
+                for name in ('expert_seeds', 'start_steps', 'goal_steps')
+            ]
+            if (
+                not errors
+                or any(
+                    len(values) != len(errors) for values in [seeds, *metadata]
+                )
+                or any(
+                    value is not None
+                    and (not math.isfinite(value) or int(value) != value)
+                    for values in [seeds, *metadata]
+                    for value in values
+                )
+            ):
+                series.append([])
+                continue
+            series.append(
+                [
+                    (
+                        tuple(int(v) if v is not None else None for v in case),
+                        error,
+                    )
+                    for case, error in zip(zip(seeds, *metadata), errors)
+                ]
+            )
+        cases = sorted(
+            {case for points in series for case, _ in points},
+            key=lambda case: tuple(
+                -math.inf if value is None else value for value in case
+            ),
+        )
+        positions = {case: index for index, case in enumerate(cases)}
+        labels = [
+            str(seed)
+            if expert is None or expert == seed
+            else f'{seed} / {expert}'
+            for seed, expert, _, _ in cases
+        ]
+        fig, (episodes_ax, means_ax) = plt.subplots(
+            2,
+            1,
+            figsize=(max(9, len(cases) * 0.5), 9),
+            constrained_layout=True,
+        )
+        for index, (evaluation, points) in enumerate(zip(evaluations, series)):
+            color = f'C{index % 10}'
+            finite = [
+                (case, value) for case, value in points if math.isfinite(value)
+            ]
+            episodes_ax.scatter(
+                [positions[case] for case, _ in finite],
+                [value for _, value in finite],
+                label=f'Run {index + 1}',
+                color=color,
+                marker=('o', 's', '^', 'D', 'v', 'P', 'X')[index % 7],
+                alpha=0.8,
+            )
+            mean = evaluation.mean_errors.get(key, math.nan)
+            if math.isfinite(mean):
+                means_ax.bar(index, mean, color=color)
+        episodes_ax.set_xticks(
+            range(len(cases)), labels, rotation=45, ha='right', fontsize=8
+        )
+        episodes_ax.set_xlabel('Eval seed / expert seed (if different)')
+        episodes_ax.set_title('Per-episode final error')
+        if cases:
+            episodes_ax.legend(fontsize=8)
+        else:
+            episodes_ax.text(
+                0.5,
+                0.5,
+                'No complete episode errors and seed arrays',
+                ha='center',
+                transform=episodes_ax.transAxes,
+            )
+        means_ax.set_xticks(
+            range(len(evaluations)),
+            [f'Run {index}' for index in range(1, len(evaluations) + 1)],
+        )
+        means_ax.set_title('Mean final error across episodes')
+        for ax in (episodes_ax, means_ax):
+            ax.set_ylabel(ERROR_METRICS[key])
+            ax.set_ylim(bottom=0)
+            ax.grid(axis='y', alpha=0.25)
+        target = figure_dir / f'{key}.png'
+        try:
+            fig.savefig(target, dpi=150)
+        finally:
+            plt.close(fig)
+        lines.extend(
+            [f'![{ERROR_METRICS[key]}]({relative_url(target, output)})', '']
+        )
+    return lines
+
+
 def write_report(
     evaluations: list[Evaluation],
     output: Path,
@@ -579,7 +776,17 @@ def write_report(
         )
     else:
         shared_lines.append('No parameters are shared across all evaluations.')
-    headers = ['Evaluation', 'Success rate (%)', *map(cell, differing)]
+    mean_keys = [
+        key
+        for key in ERROR_METRICS
+        if any(key in evaluation.mean_errors for evaluation in evaluations)
+    ]
+    headers = [
+        'Evaluation',
+        'Success rate (%)',
+        *(f'Mean {ERROR_METRICS[key]}' for key in mean_keys),
+        *map(cell, differing),
+    ]
     lines = [
         '# Evaluation results',
         '',
@@ -599,16 +806,34 @@ def write_report(
         ),
         '',
         '| ' + ' | '.join(headers) + ' |',
-        '| ' + ' | '.join(['---', '---:', *['---'] * len(differing)]) + ' |',
+        '| '
+        + ' | '.join(
+            [
+                '---',
+                '---:',
+                *['---:'] * len(mean_keys),
+                *['---'] * len(differing),
+            ]
+        )
+        + ' |',
     ]
     for index, (evaluation, config) in enumerate(zip(evaluations, configs), 1):
         name = evaluation.source.parent.relative_to(root).as_posix()
         values = [
             f'Run {index} — {cell(name)}',
             f'{evaluation.success_rate:.2f}',
+            *(
+                f'{evaluation.mean_errors[key]:.6g}'
+                if key in evaluation.mean_errors
+                and math.isfinite(evaluation.mean_errors[key])
+                else '—'
+                for key in mean_keys
+            ),
             *(cell(config.get(key, '—')) for key in differing),
         ]
         lines.append('| ' + ' | '.join(values) + ' |')
+
+    lines.extend(error_plots(evaluations, output))
 
     for index, evaluation in enumerate(evaluations, 1):
         lines.extend(

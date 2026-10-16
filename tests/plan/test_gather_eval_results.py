@@ -58,6 +58,183 @@ def test_latest_record_and_complete_numpy_arrays(tmp_path):
     assert evaluation.config['plan_config']['receding_horizon'] == 2
 
 
+def error_result(directory, metrics):
+    path = result(directory)
+    path.write_text(
+        path.read_text().replace(
+            'evaluation_time:', f'error_metrics: {metrics}\nevaluation_time:'
+        )
+    )
+    return path
+
+
+def test_error_metrics_parse_latest_record_without_executing_text(tmp_path):
+    path = error_result(tmp_path, "{'mean_xy_error_m': 99}")
+    previous = path.read_text()
+    error_result(
+        tmp_path,
+        """{
+        'seeds': array([2, 9007199254740993], dtype=int64),
+        'expert_seeds': [200, 300], 'start_steps': [0, 10],
+        'goal_steps': [10, 20],
+        'episode_xy_error_m': array([1.e-2, 2.e-2], dtype=float32),
+        'episode_eef_position_error_m': [nan, 0.03],
+        'episode_yaw_error_rad': [0.1, inf],
+        'mean_xy_error_m': np.float64(1.5e-2),
+        'mean_eef_position_error_m': nan,
+        'mean_yaw_error_rad': __import__('os').system('false')
+    }""",
+    )
+    path.write_text(previous + path.read_text())
+    evaluation = parse_result(path)
+    assert evaluation.metric_arrays['seeds'] == [2, 9007199254740993]
+    assert evaluation.metric_arrays['expert_seeds'] == [200, 300]
+    assert evaluation.metric_arrays['episode_xy_error_m'] == [0.01, 0.02]
+    assert evaluation.mean_errors['xy_error_m'] == 0.015
+    assert str(evaluation.mean_errors['eef_position_error_m']) == 'nan'
+    assert 'yaw_error_rad' not in evaluation.mean_errors
+
+
+def test_report_plots_align_seed_pairs_and_steps(tmp_path, monkeypatch):
+    from matplotlib.axes import Axes
+    from PIL import Image
+
+    first = parse_result(
+        error_result(
+            tmp_path / 'cube_a',
+            """{
+        'seeds': [10, 2, 4, 4], 'expert_seeds': [100, 2, 40, 40],
+        'start_steps': [0, 0, 0, 1], 'goal_steps': [5, 5, 5, 6],
+        'episode_xy_error_m': [0.1, 0.2, 0.3, 0.4],
+        'episode_eef_position_error_m': [nan, 0.1, 0.2, 0.3],
+        'episode_yaw_error_rad': [0.1, 0.2, 0.3, 0.4],
+        'mean_xy_error_m': 0.25, 'mean_eef_position_error_m': nan,
+        'mean_yaw_error_rad': 0.25
+    }""",
+        )
+    )
+    second = parse_result(
+        error_result(
+            tmp_path / 'cube_b',
+            """{
+        'seeds': [2, 10], 'expert_seeds': [2, 101],
+        'start_steps': [0, 0], 'goal_steps': [5, 5],
+        'episode_xy_error_m': [0.15, 0.05], 'mean_xy_error_m': 0.1
+    }""",
+        )
+    )
+    points = []
+    means = []
+    episode_axes = []
+    scatter, bar = Axes.scatter, Axes.bar
+
+    def capture_scatter(ax, x, y, **kwargs):
+        points.append((x, y, kwargs['label']))
+        episode_axes.append(ax)
+        return scatter(ax, x, y, **kwargs)
+
+    def capture_bar(ax, x, height, **kwargs):
+        means.append((x, height))
+        return bar(ax, x, height, **kwargs)
+
+    monkeypatch.setattr(Axes, 'scatter', capture_scatter)
+    monkeypatch.setattr(Axes, 'bar', capture_bar)
+    output = tmp_path / 'report' / 'comparison.md'
+    write_report([first, second], output, tmp_path, 'cube_', copy_videos=False)
+    report = output.read_text()
+    assert '## Error comparison' in report
+    assert 'Mean T XY error (m)' in report
+    assert '| 0.25 | — | 0.25 |' in report
+    assert '| 0.1 | — | — |' in report
+    assert points[0] == ([3, 0, 1, 2], [0.1, 0.2, 0.3, 0.4], 'Run 1')
+    assert points[1] == ([0, 4], [0.15, 0.05], 'Run 2')
+    assert points[2] == ([0, 1, 2], [0.1, 0.2, 0.3], 'Run 1')
+    assert means == [(0, 0.25), (1, 0.1), (0, 0.25)]
+    assert [tick.get_text() for tick in episode_axes[0].get_xticklabels()] == [
+        '2',
+        '4 / 40',
+        '4 / 40',
+        '10 / 100',
+        '10 / 101',
+    ]
+    assert (
+        episode_axes[0].get_xlabel()
+        == 'Eval seed / expert seed (if different)'
+    )
+    figures = re.findall(r'!\[[^\]]+\]\(([^)]+)\)', report)
+    assert len(figures) == 3
+    for figure in figures:
+        with Image.open(output.parent / figure) as image:
+            image.verify()
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [
+        "'seeds': [1, ..., 3]",
+        "'seeds': [1]",
+        "'seeds': [nan, 2]",
+        "'seeds': [1.5, 2]",
+        "'seeds': [1, 2], 'expert_seeds': [10, ..., 20]",
+        '',
+    ],
+)
+def test_incomplete_seed_metadata_keeps_means_without_guessing_cases(
+    tmp_path, metadata, monkeypatch
+):
+    from matplotlib.axes import Axes
+
+    evaluation = parse_result(
+        error_result(
+            tmp_path / 'cube_a',
+            "{'episode_xy_error_m': [0.1, 0.2], 'mean_xy_error_m': 0.15, "
+            + metadata
+            + '}',
+        )
+    )
+    points = []
+    scatter = Axes.scatter
+
+    def capture(ax, x, y, **kwargs):
+        points.append((x, y))
+        return scatter(ax, x, y, **kwargs)
+
+    monkeypatch.setattr(Axes, 'scatter', capture)
+    output = tmp_path / 'comparison.md'
+    write_report([evaluation], output, tmp_path, 'cube_')
+    assert points == [([], [])]
+    assert '| 0.15 |' in output.read_text()
+    assert (tmp_path / 'comparison_figures/xy_error_m.png').is_file()
+
+
+def test_cli_error_plots_support_eval_seeds_without_expert_metadata(tmp_path):
+    error_result(
+        tmp_path / 'cube_a',
+        """{
+        'seeds': array([2, 3]), 'episode_xy_error_m': [0.1, 0.2],
+        'mean_xy_error_m': 0.15
+    }""",
+    )
+    output = tmp_path / 'comparison.md'
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            str(tmp_path),
+            '--prefix',
+            'cube_',
+            '-o',
+            str(output),
+            '--link-videos',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert 'comparison_figures/xy_error_m.png' in output.read_text()
+
+
 @pytest.mark.parametrize('outcomes', ['True, ..., False', '', '1, 2, 0'])
 def test_incomplete_outcomes_do_not_guess_video_class(tmp_path, outcomes):
     evaluation = parse_result(result(tmp_path, outcomes=outcomes))

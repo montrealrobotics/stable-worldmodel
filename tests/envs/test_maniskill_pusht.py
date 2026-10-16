@@ -177,6 +177,7 @@ class AdapterTests(unittest.TestCase):
             env._goal_eef_position, torch.tensor([[0.0, 0.0, 0.1]])
         )
         self.assertTrue(env.replay_report['passed'])
+        self.assertAlmostEqual(info['eef_position_error_m'], 0.1)
         self.assertAlmostEqual(env.replay_report['eef_position_error_m'], 0)
         self.assertFalse(info['success'])
         self.assertAlmostEqual(env._goal_errors()['eef_position_error_m'], 0.1)
@@ -261,6 +262,8 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue((info['goal'] == 1).all())
         self.assertEqual(scene.steps, 0)
         self.assertTrue(env.replay_report['passed'])
+        self.assertAlmostEqual(info['eef_position_error_m'], 0.1)
+        self.assertAlmostEqual(env.replay_report['eef_position_error_m'], 0)
         np.testing.assert_array_equal(
             info['goal_obs_agent_qpos'], env.goal_observation['obs_agent_qpos']
         )
@@ -695,6 +698,7 @@ def test_comparison_replays_both_sequences_without_advancing_live_scene(
     env.goal_position_tolerance = 0.02
     env.goal_yaw_tolerance = 0.15
     env.goal_eef_position_tolerance = None
+    env._goal_eef_position = None
     captured = []
 
     def save(output, panels, fps):
@@ -721,3 +725,35 @@ def test_comparison_replays_both_sequences_without_advancing_live_scene(
     with np.load(tmp_path / 'comparison' / 'actions.npz') as saved:
         np.testing.assert_array_equal(saved['expert'], np.zeros((3, 2)))
         np.testing.assert_array_equal(saved['selected'], np.ones((3, 2)))
+
+
+@pytest.mark.parametrize(
+    'yaw,goal_yaw,expected',
+    [
+        (0.0, 2 * np.pi, 0.0),
+        (np.pi - 0.01, -np.pi + 0.01, 0.02),
+        (0.0, np.pi, np.pi),
+    ],
+)
+def test_goal_distances_use_xy_xyz_and_wrapped_yaw(yaw, goal_yaw, expected):
+    scene = FakeScene()
+    with patch(
+        'stable_worldmodel.envs.maniskill.pusht.gym.make', return_value=scene
+    ):
+        env = PushTSWMEnv(image_size=8)
+    scene.tee.pose = Pose.create_from_pq(
+        p=[0, 0, 0.021], q=[np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
+    )
+    scene.goal_tee.pose = Pose.create_from_pq(
+        p=[0.03, 0.04, 0.001],
+        q=[np.cos(goal_yaw / 2), 0, 0, np.sin(goal_yaw / 2)],
+    )
+    _, info = env.reset(seed=42)
+    assert info['xy_error_m'] == pytest.approx(0.05)
+    assert info['yaw_error_rad'] == pytest.approx(expected, abs=1e-6)
+    assert np.isnan(info['eef_position_error_m'])
+    env._goal_pose = scene.goal_tee.pose.raw_pose.clone()
+    env._goal_eef_position = torch.tensor([[0.03, 0.04, 0.22]])
+    # EEF distance is measured even when it is not required for success.
+    _, _, _, _, info = env.step(np.zeros(2))
+    assert info['eef_position_error_m'] == pytest.approx(0.13)

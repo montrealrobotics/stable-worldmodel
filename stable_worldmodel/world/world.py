@@ -54,6 +54,17 @@ from ..wrapper import MegaWrapper
 from .env_pool import EnvPool
 
 RESET_MODES = ('auto', 'wait')
+GOAL_ERROR_KEYS = ('xy_error_m', 'eef_position_error_m', 'yaw_error_rad')
+
+
+def _record_goal_errors(results, infos, env_idx, episode_idx, episodes):
+    """Copy final goal errors before an environment resets its info buffer."""
+    for key in GOAL_ERROR_KEYS:
+        if key in infos:
+            values = results.setdefault(
+                f'episode_{key}', [float('nan')] * episodes
+            )
+            values[episode_idx] = float(np.asarray(infos[key][env_idx]).item())
 
 
 def _reorder_videos(video, prefix, order):
@@ -268,6 +279,11 @@ class World:
             Per-episode values are ordered by reset seed in ascending order
             when seeds are available, preserving ties in their original order.
             Saved video indices follow the same order as these values.
+            Environments providing goal errors also include final
+            ``episode_xy_error_m`` (T XY distance),
+            ``episode_eef_position_error_m`` (EEF XYZ distance), and
+            ``episode_yaw_error_rad`` (shortest T yaw angle), with their
+            ``mean_*`` values. Missing EEF targets are reported as NaN.
         """
         if dataset is not None:
             mode = reset_mode or 'wait'
@@ -295,6 +311,7 @@ class World:
                 'start_steps',
                 'goal_steps',
                 'goal_step_distances',
+                *(f'episode_{key}' for key in GOAL_ERROR_KEYS),
             ):
                 if key in results:
                     values = results[key]
@@ -306,6 +323,11 @@ class World:
             if video:
                 prefix = 'env' if dataset is not None else 'episode'
                 _reorder_videos(video, prefix, order)
+        for key in GOAL_ERROR_KEYS:
+            if f'episode_{key}' in results:
+                results[f'mean_{key}'] = float(
+                    np.mean(results[f'episode_{key}'])
+                )
         return results
 
     def collect(
@@ -559,6 +581,9 @@ class World:
         def on_done(env_idx, ep_idx, world):
             results['episode_successes'][ep_idx] = world.terminateds[env_idx]
             results['seeds'][ep_idx] = world.envs.seeds[env_idx]
+            _record_goal_errors(
+                results, world.infos, env_idx, ep_idx, episodes
+            )
             for info_key, result_key in (
                 ('expert_seed', 'expert_seeds'),
                 ('expert_requested_seed', 'expert_requested_seeds'),
@@ -700,10 +725,14 @@ class World:
             'goal_step_distances': [int(goal_offset)] * n,
         }
         frames: dict[int, list] = defaultdict(list) if video else None
+        finished = np.zeros(n, dtype=bool)
 
         def on_step(world, mask):
             world.infos.update(deepcopy(goal_snapshot))
             results['episode_successes'] |= world.terminateds
+            for i in np.where(mask & ~finished)[0]:
+                _record_goal_errors(results, world.infos, i, i, n)
+            finished[:] |= world.terminateds | world.truncateds
             if frames is not None:
                 for i in range(world.num_envs):
                     f = world.infos['pixels'][i]
