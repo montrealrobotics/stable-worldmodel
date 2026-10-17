@@ -348,16 +348,6 @@ class PushTSWMEnv(gym.Env):
             )
             if success and not too_static:
                 break
-            reason = (
-                'expert did not solve the native task'
-                if not success
-                else f'start-goal movement too small (object={object_displacement:.4f} '
-                f'm, EEF={eef_displacement:.4f} m)'
-            )
-            print(
-                f'Rejecting expert seed={seed}, attempt={attempt}: {reason}',
-                flush=True,
-            )
             if attempt < self.expert_max_attempts:
                 # A deterministic expert needs a different scene to retry.
                 seed = int(retry_rng.integers(0, 2**31 - 1))
@@ -368,7 +358,6 @@ class PushTSWMEnv(gym.Env):
         else:
             raise RuntimeError(
                 f'No valid expert rollout after {self.expert_max_attempts} '
-                f'attempts from seed {requested_seed}; last seed={seed}: {reason}'
             )
         # Oracle replay must reconstruct the accepted scene, not the first try.
         self._evaluation_seed = seed
@@ -465,11 +454,6 @@ class PushTSWMEnv(gym.Env):
             raise RuntimeError(
                 f'Expert replay failed for seed {seed}: {self.replay_report}'
             )
-        print(
-            f'Expert seed={seed}: length={len(actions)}, goal_step={index}, '
-            f'task_success={success}',
-            flush=True,
-        )
         return obs, info
 
     def _goal_errors(self, base=None):
