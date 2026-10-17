@@ -145,7 +145,8 @@ def test_report_plots_align_seed_pairs_and_steps(tmp_path, monkeypatch):
     assert '## Error comparison' in report
     assert 'Mean T XY error (m)' in report
     assert '| 0.25 | — | 0.25 |' in report
-    assert '| 0.1 | — | — |' in report
+    # Only XY has competing runs; the lower mean is underlined.
+    assert '| <u>0.1</u> | — | — |' in report
     assert points[0] == ([3, 0, 1, 2], [0.1, 0.2, 0.3, 0.4], 'Run 1')
     assert points[1] == ([0, 4], [0.15, 0.05], 'Run 2')
     assert points[2] == ([0, 1, 2], [0.1, 0.2, 0.3], 'Run 1')
@@ -162,7 +163,8 @@ def test_report_plots_align_seed_pairs_and_steps(tmp_path, monkeypatch):
         == 'Eval seed / expert seed (if different)'
     )
     figures = re.findall(r'!\[[^\]]+\]\(([^)]+)\)', report)
-    assert len(figures) == 3
+    assert len(figures) == 4  # three metrics plus the mean-error lines
+    assert figures[-1].endswith('mean_errors.png')
     for figure in figures:
         with Image.open(output.parent / figure) as image:
             image.verify()
@@ -446,7 +448,14 @@ def test_report_includes_landscapes_and_expert_selection(
             'replan_index': 1,
             'outcomes': {
                 'expert': {'final_goal_success': True},
-                'selected': {'final_goal_success': False},
+                'selected': {
+                    'final_goal_success': False,
+                    'final_goal_errors': {
+                        'xy_error_m': 0.05,
+                        'yaw_error_rad': 0.1,
+                        'eef_position_error_m': 0.3,
+                    },
+                },
             },
         }
     ]
@@ -500,9 +509,13 @@ def test_report_includes_landscapes_and_expert_selection(
     assert 'Final goal success' in report
     assert '| expert | True |' in report
     assert '| selected | False |' in report
+    # Only XY exceeds its tolerance; EEF has no tolerance unless configured.
+    assert '| selected | False | 0.05 | 0.1 | 0.3 | T position |' in report
     comparison_copies = list((output.parent / 'results_videos').rglob('*.mp4'))
     assert len(comparison_copies) == (3 if copy_assets else 0)
     assert report.count('### cube_eval') == 1
+    # Generic diagnostic dir names are labeled by their path under the root.
+    assert '### landscapes/landscape_0' in report
     assert '![landscape]' in report and '![landscape_3d]' in report
     assert 'Minimum-energy grid action | Goal' in report
     assert (

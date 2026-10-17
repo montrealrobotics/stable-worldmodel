@@ -48,6 +48,8 @@ ABSOLUTE_PATH = re.compile(
     r"""(?P<bare>(?:/|~[/\\]|[A-Za-z]:[/\\])"""
     r"""[^\s'"`<>\[\]{},;|()]+))"""
 )
+# Run directories named <model>_ep<N> become one line per model over epochs.
+EPOCH = re.compile(r'^(.*)_ep(\d+)$')
 ERROR_METRICS = {
     'xy_error_m': 'T XY error (m)',
     'eef_position_error_m': 'EEF position error (m)',
@@ -315,6 +317,25 @@ def experiment_files(directories: list[Path], name: str) -> list[Path]:
     )
 
 
+FAILURE_LABELS = {
+    'xy_error_m': 'T position',
+    'yaw_error_rad': 'T orientation',
+    'eef_position_error_m': 'EEF position',
+}
+
+
+def failed_checks(errors: dict, tolerances: list) -> str:
+    """Name the goal tolerances an outcome's final errors exceed."""
+    failed = [
+        FAILURE_LABELS[key]
+        for key, tolerance in tolerances
+        if tolerance is not None
+        and isinstance(errors.get(key), (int, float))
+        and errors[key] > tolerance
+    ]
+    return ', '.join(failed) or '—'
+
+
 def experiment_section(
     title: str,
     files: list[Path],
@@ -322,6 +343,7 @@ def experiment_section(
     copy_assets: bool,
     warnings: list[str],
     landscape: bool = False,
+    root: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     """Summarize saved diagnostic JSON and link or copy visualization assets."""
     rows = []
@@ -389,8 +411,17 @@ def experiment_section(
             '| ' + ' | '.join('---' for _ in headers) + ' |',
         ]
     )
+
+    def run_label(path: Path) -> str:
+        # Diagnostic dirs share generic names, so show which run they belong to.
+        if root is not None and path.parent.is_relative_to(root.resolve()):
+            relative = path.parent.relative_to(root.resolve()).as_posix()
+            if relative != '.':
+                return relative
+        return path.parent.name
+
     for (path, data), config in zip(rows, configs):
-        values = [cell(path.parent.name)]
+        values = [cell(run_label(path))]
         values.extend(cell(data.get(key, '—')) for key in metric_keys)
         values.extend(cell(config.get(key, '—')) for key in differing)
         lines.append('| ' + ' | '.join(values) + ' |')
@@ -398,10 +429,20 @@ def experiment_section(
         lines.extend(
             [
                 '',
-                f'### {cell(path.parent.name)}',
+                f'### {cell(run_label(path))}',
                 '',
             ]
         )
+        world = diagnostics.get('config', {}).get('world', {}) or {}
+        # Mirrors ManiSkill PushT goal success; EEF counts only when set.
+        tolerances = [
+            ('xy_error_m', world.get('goal_position_tolerance', 0.02)),
+            ('yaw_error_rad', world.get('goal_yaw_tolerance', 0.15)),
+            (
+                'eef_position_error_m',
+                world.get('goal_eef_position_tolerance'),
+            ),
+        ]
         if landscape:
             video = diagnostics.get('comparison_video')
             if isinstance(video, str):
@@ -437,13 +478,7 @@ def experiment_section(
                     )
             images = [
                 path.parent / name
-                for name in (
-                    'landscape.png',
-                    'landscape_3d.png',
-                    'trajectory.png',
-                    'start.png',
-                    'goal.png',
-                )
+                for name in ('landscape.png', 'landscape_3d.png')
                 if (path.parent / name).is_file()
             ]
             if not images:
@@ -511,12 +546,29 @@ def experiment_section(
                 outcomes = comparison.get('outcomes', {})
                 if isinstance(outcomes, dict):
                     lines.extend(
-                        ['| Sequence | Final goal success |', '| --- | --- |']
+                        [
+                            '| Sequence | Final goal success | T XY error (m) '
+                            '| T yaw error (rad) | EEF position error (m) '
+                            '| Failed on |',
+                            '| --- | --- | --- | --- | --- | --- |',
+                        ]
                     )
                     for name, outcome in outcomes.items():
                         if isinstance(outcome, dict):
+                            errors = outcome.get('final_goal_errors') or {}
+                            row = [
+                                name,
+                                outcome.get('final_goal_success', '—'),
+                                *(
+                                    round(errors[key], 4)
+                                    if isinstance(errors.get(key), float)
+                                    else errors.get(key, '—')
+                                    for key, _ in tolerances
+                                ),
+                                failed_checks(errors, tolerances),
+                            ]
                             lines.append(
-                                f'| {cell(name)} | {cell(outcome.get("final_goal_success", "—"))} |'
+                                '| ' + ' | '.join(map(cell, row)) + ' |'
                             )
                     lines.append('')
             selections = diagnostics.get('selections', [])
@@ -730,7 +782,53 @@ def error_plots(evaluations: list[Evaluation], output: Path) -> list[str]:
         lines.extend(
             [f'![{ERROR_METRICS[key]}]({relative_url(target, output)})', '']
         )
+    lines.extend(mean_error_lines(evaluations, metrics, figure_dir, output))
     return lines
+
+
+def mean_error_lines(
+    evaluations: list[Evaluation],
+    metrics: list[str],
+    figure_dir: Path,
+    output: Path,
+) -> list[str]:
+    """Plot mean errors as lines, one per run name with its _epN removed."""
+    import matplotlib.pyplot as plt
+
+    groups: dict[str, list[tuple[int, Evaluation]]] = {}
+    for index, evaluation in enumerate(evaluations, 1):
+        name = evaluation.source.parent.name
+        match = EPOCH.match(name)
+        group, x = (match[1], int(match[2])) if match else (name, index)
+        groups.setdefault(group, []).append((x, evaluation))
+    epochs = all(EPOCH.match(e.source.parent.name) for e in evaluations)
+    fig, axes = plt.subplots(
+        len(metrics),
+        1,
+        figsize=(9, 3.5 * len(metrics)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for ax, key in zip(axes[:, 0], metrics):
+        for group, points in groups.items():
+            points = sorted(
+                (x, e.mean_errors.get(key, math.nan)) for x, e in points
+            )
+            points = [(x, y) for x, y in points if math.isfinite(y)]
+            if points:
+                ax.plot(*zip(*points), marker='o', label=group)
+        ax.set_ylabel(ERROR_METRICS[key])
+        ax.set_xlabel('Epoch' if epochs else 'Run')
+        ax.set_ylim(bottom=0)
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8)
+    axes[0, 0].set_title('Mean final error across episodes')
+    target = figure_dir / 'mean_errors.png'
+    try:
+        fig.savefig(target, dpi=150)
+    finally:
+        plt.close(fig)
+    return [f'![Mean errors]({relative_url(target, output)})', '']
 
 
 def write_report(
@@ -781,6 +879,23 @@ def write_report(
         for key in ERROR_METRICS
         if any(key in evaluation.mean_errors for evaluation in evaluations)
     ]
+    # Lowest finite mean per error column, underlined when runs compete.
+    best_errors = {}
+    for key in mean_keys:
+        finite = [
+            e.mean_errors[key]
+            for e in evaluations
+            if math.isfinite(e.mean_errors.get(key, math.nan))
+        ]
+        best_errors[key] = min(finite) if len(finite) > 1 else None
+
+    def error_cell(evaluation, key):
+        value = evaluation.mean_errors.get(key, math.nan)
+        if not math.isfinite(value):
+            return '—'
+        text = f'{value:.6g}'
+        return f'<u>{text}</u>' if value == best_errors[key] else text
+
     headers = [
         'Evaluation',
         'Success rate (%)',
@@ -802,7 +917,8 @@ def write_report(
         '',
         (
             'Only differing model, planning, and evaluation settings are shown '
-            'below. A dash means the parameter was absent from that run.'
+            'below. A dash means the parameter was absent from that run. '
+            'The lowest mean error in each column is underlined.'
         ),
         '',
         '| ' + ' | '.join(headers) + ' |',
@@ -822,13 +938,7 @@ def write_report(
         values = [
             f'Run {index} — {cell(name)}',
             f'{evaluation.success_rate:.2f}',
-            *(
-                f'{evaluation.mean_errors[key]:.6g}'
-                if key in evaluation.mean_errors
-                and math.isfinite(evaluation.mean_errors[key])
-                else '—'
-                for key in mean_keys
-            ),
+            *(error_cell(evaluation, key) for key in mean_keys),
             *(cell(config.get(key, '—')) for key in differing),
         ]
         lines.append('| ' + ' | '.join(values) + ' |')
@@ -920,7 +1030,7 @@ def write_report(
         ('Expert-action selection', expert_files, False),
     ):
         section, common = experiment_section(
-            title, files, output, copy_videos, warnings, landscape
+            title, files, output, copy_videos, warnings, landscape, root
         )
         lines.extend(section)
         shared_lines.extend(common)
