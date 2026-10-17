@@ -93,13 +93,13 @@ simulator motion.
 
 ## Endpoint energy
 
-The script follows the endpoint L1 diagnostic: it encodes the starting and
-goal observations, rolls out candidate sequences, and compares only the final
-prediction with the goal embedding using mean absolute error.
+The script encodes the starting and goal observations, rolls out candidate
+sequences, and compares only the final prediction with the goal embedding
+using mean squared error, matching the `GoalMSE` planning objective.
 
 `normalize_reps=true` layer-normalizes context, goal, and every predicted
-embedding before it is fed back into subsequent predictions. Set it to
-`false` to disable this additional normalization. Input z-score and RGB
+embedding before it is fed back into subsequent predictions. It defaults to
+`false`, matching `eval_wm.py` planning on raw latents. Input z-score and RGB
 preprocessing remain active. These rules apply equally to the grid and expert
 reference. `horizon` controls their number of model predictions and the expert
 start/goal separation. For example:
@@ -118,8 +118,6 @@ all 25 expert commands.
 
 - `landscape.png` and `landscape.pdf`: energy-weighted XY histogram.
 - `landscape_3d.png` and `landscape_3d.pdf`: measured endpoint-energy surface.
-- `trajectory.png`: expert frames sampled every action block, including start
-  and goal. `start.png` and `goal.png` save the endpoints separately.
 - `best_action/env_0.mp4`: three panels showing the minimum-energy grid action,
   replayed expert actions, and the fixed goal. Both action sequences are executed
   from the same sampled expert start using the existing environment oracle.

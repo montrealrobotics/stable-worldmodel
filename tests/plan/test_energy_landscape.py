@@ -211,11 +211,10 @@ def test_complete_expert_evaluation(tmp_path, monkeypatch, state, expert_mean):
         'landscape.pdf',
         'landscape_3d.png',
         'landscape_3d.pdf',
-        'trajectory.png',
-        'start.png',
-        'goal.png',
     ):
         assert (tmp_path / filename).stat().st_size > 0
+    for filename in ('trajectory.png', 'start.png', 'goal.png'):
+        assert not (tmp_path / filename).exists()
     assert json.loads((tmp_path / 'results.json').read_text()) == result
     assert result['goal_source'] == 'expert'
     assert result['context_step'] == 7
@@ -238,9 +237,7 @@ def test_complete_expert_evaluation(tmp_path, monkeypatch, state, expert_mean):
         np.testing.assert_allclose(
             data['ground_truth_action_total_delta'], raw.sum((0, 1)) * 0.1
         )
-        np.testing.assert_array_equal(
-            data['clip_frames'], env.expert_frames[[0, 2, 4]]
-        )
+        assert 'clip_frames' not in data.files
         assert data['model_action_sequences'].shape == (9, 2, 4)
         assert data['controller_action_sequences'].shape == (9, 2, 2, 2)
         np.testing.assert_allclose(
@@ -282,18 +279,15 @@ def test_expert_endpoints_use_training_normalization(tmp_path, state):
     )
     stats.data['obs'] = np.array([[0, 0], [2, 4]], dtype=np.float32)
     env = ExpertEnvironment()
-    info, scaler, preview, pose_delta, raw, _metadata = (
-        evaluation.prepare_expert_case(
-            env,
-            stats,
-            LinearDynamics(state),
-            cfg,
-        )
+    info, scaler, pose_delta, raw, _metadata = evaluation.prepare_expert_case(
+        env,
+        stats,
+        LinearDynamics(state),
+        cfg,
     )
     assert info['action_history'].shape == (1, 0, 4)
     np.testing.assert_allclose(scaler.mean, [[0.5, 0.1]], atol=1e-7)
     np.testing.assert_array_equal(raw.flatten(0, 1), env.expert_actions[:4])
-    np.testing.assert_array_equal(preview, env.expert_frames[[0, 2, 4]])
     np.testing.assert_allclose(
         pose_delta, env.goal_observation['obs'] - env.start
     )

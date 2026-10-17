@@ -19,7 +19,6 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from PIL import Image
 from torchvision.transforms import v2
 
 import stable_worldmodel as swm
@@ -122,7 +121,6 @@ def prepare_expert_case(env, stats, model, cfg):
     goal = {**env.goal_observation, 'pixels': env.expert_frames[steps]}
     start = {**start, 'pixels': env.expert_frames[0]}
     info, scaler = case_from_observations(start, goal, stats, model, cfg)
-    preview = env.expert_frames[: steps + 1 : cfg.action_block].copy()
     pose_delta = (
         np.asarray(goal[cfg.pose_column])[:2]
         - np.asarray(start[cfg.pose_column])[:2]
@@ -132,7 +130,7 @@ def prepare_expert_case(env, stats, model, cfg):
         for key, value in reset_info.items()
         if key.startswith('expert_') or key == 'goal_step_distance'
     }
-    return info, scaler, preview, pose_delta, raw, metadata
+    return info, scaler, pose_delta, raw, metadata
 
 
 def build_action_grid(cfg, scaler, expert_raw):
@@ -179,14 +177,15 @@ def evaluate(cfg):
 
 def evaluate_case(model, stats, env, cfg):
     """Score the grid and expert reference from the restored start."""
-    info, scaler, preview, pose_delta, expert_raw, expert_metadata = (
+    info, scaler, pose_delta, expert_raw, expert_metadata = (
         prepare_expert_case(env, stats, model, cfg)
     )
     axes, raw_candidates, candidates, clipped = build_action_grid(
         cfg, scaler, expert_raw
     )
     model = NotebookDynamics(model, normalize=cfg.normalize_reps).eval()
-    objective = EndpointEnergy('l1', normalize=False)
+    # MSE matches the GoalMSE objective the planner optimizes.
+    objective = EndpointEnergy('mse', normalize=False)
     energy = evaluate_action_sequences(
         model, info, candidates, objective, cfg.chunk_size
     )
@@ -221,8 +220,6 @@ def evaluate_case(model, stats, env, cfg):
         },
         output / 'best_action',
     )
-    Image.fromarray(preview[0]).save(output / 'start.png')
-    Image.fromarray(preview[-1]).save(output / 'goal.png')
     start_step = expert_metadata['expert_start_step']
     metadata = {
         'config': OmegaConf.to_container(cfg, resolve=True),
@@ -275,7 +272,6 @@ def evaluate_case(model, stats, env, cfg):
         raw_actions=raw_candidates[:, 0, 0].numpy(),
         controller_action_sequences=raw_candidates.numpy(),
         model_action_sequences=candidates.numpy(),
-        clip_frames=preview,
     )
     metadata_json = json.dumps(metadata, indent=2)
     (output / 'results.json').write_text(metadata_json + '\n')
@@ -288,7 +284,6 @@ def evaluate_case(model, stats, env, cfg):
         pose_delta,
         metadata,
         output,
-        preview,
     )
     print(metadata_json)
     print(f'Saved energy landscape to {output.resolve()}')
@@ -304,7 +299,6 @@ def plot_landscape(
     ground_truth,
     metadata,
     output,
-    preview=None,
 ):
     """Render measured samples with Figure 9's mesh and color presentation.
 
@@ -428,7 +422,7 @@ def plot_landscape(
             orientation='horizontal',
             pad=0.08,
             shrink=0.85,
-            label='Endpoint L1 energy (weighted histogram)',
+            label='Endpoint MSE energy (weighted histogram)',
         )
         fig.supxlabel(note, fontsize=8, color='#555555')
         for suffix in ('png', 'pdf'):
@@ -506,27 +500,6 @@ def plot_landscape(
         for suffix in ('png', 'pdf'):
             fig.savefig(output / f'landscape_3d.{suffix}', bbox_inches='tight')
         plt.close(fig)
-
-        if preview is not None and len(preview):
-            fig, axes = plt.subplots(
-                1,
-                len(preview),
-                figsize=(3 * len(preview), 3),
-                squeeze=False,
-                layout='constrained',
-            )
-            for i, (ax, frame) in enumerate(zip(axes[0], preview)):
-                ax.imshow(frame)
-                ax.set_title(
-                    'Start'
-                    if i == 0
-                    else 'Goal'
-                    if i == len(preview) - 1
-                    else f'Frame {i}'
-                )
-                ax.axis('off')
-            fig.savefig(output / 'trajectory.png')
-            plt.close(fig)
     print(note)
 
 
@@ -569,7 +542,6 @@ def replot_landscape(path, output_dir):
             metadata['ground_truth_action_total_delta'] = data[
                 'ground_truth_action_total_delta'
             ].tolist()
-        preview = data.get('clip_frames')
         plot_landscape(
             axis,
             energy,
@@ -579,7 +551,6 @@ def replot_landscape(path, output_dir):
             ground_truth,
             metadata,
             output_dir,
-            preview,
         )
     print(f'Rendered saved energy samples to {Path(output_dir).resolve()}')
 

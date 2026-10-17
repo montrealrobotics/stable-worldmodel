@@ -33,8 +33,9 @@ samples: 15
 # XY offset half-width in meters per model step (0.2 controller units/step).
 grid_size: 0.1
 chunk_size: 64
-# Toggle extra layer norm on context, goal, and prediction feedback.
-normalize_reps: true
+# Extra layer norm on context, goal, and prediction feedback; off matches
+# eval_wm planning (GoalMSE on raw latents).
+normalize_reps: false
 seed: 42
 output_dir: ${oc.env:STABLEWM_HOME}/evals/energy_landscape_${now:%Y%m%d_%H%M%S}
 hydra:
