@@ -6,6 +6,7 @@ import hydra
 import lightning as pl
 import stable_pretraining as spt
 import torch
+import torch._functorch.config
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import WandbLogger
@@ -59,26 +60,35 @@ def get_img_preprocessor(
 
 
 class SaveCkptCallback(Callback):
-    """Callback to save model checkpoint after each epoch using save_pretrained."""
+    """Save the model with save_pretrained every ``epoch_interval`` epochs.
+
+    Also saves the final weights when training ends off-interval, including
+    a partial last epoch when ``max_steps`` stops training.
+    """
 
     def __init__(self, run_name, cfg, epoch_interval: int = 1):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
         self.epoch_interval = epoch_interval
+        self._saved_epoch = None
 
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
+        epoch = trainer.current_epoch + 1
+        if trainer.is_global_zero and epoch % self.epoch_interval == 0:
+            self._save(pl_module.model, epoch)
 
-        if trainer.is_global_zero:
-            if (trainer.current_epoch + 1) % self.epoch_interval == 0:
-                self._save(pl_module.model, trainer.current_epoch + 1)
-
-            # save final epoch
-            if (trainer.current_epoch + 1) == trainer.max_epochs:
-                self._save(pl_module.model, trainer.current_epoch + 1)
+    def on_train_end(self, trainer, pl_module):
+        super().on_train_end(trainer, pl_module)
+        # current_epoch counts finished epochs here, plus one if stopped
+        # mid-epoch, matching the 1-based names used above.
+        epoch = max(trainer.current_epoch, 1)
+        if trainer.is_global_zero and self._saved_epoch != epoch:
+            self._save(pl_module.model, epoch)
 
     def _save(self, model, epoch):
+        self._saved_epoch = epoch
         save_pretrained(
             model,
             run_name=self.run_name,
@@ -329,6 +339,8 @@ def run(cfg):
     else:
         world_model = hydra.utils.instantiate(cfg.model)
     if cfg.get('compile', False):
+        # Gradient diagnostics backprop with retain_graph=True.
+        torch._functorch.config.donated_buffer = False
         world_model.encode = torch.compile(world_model.encode)
         world_model.predict = torch.compile(world_model.predict)
 
@@ -380,7 +392,7 @@ def run(cfg):
     save_ckpt_callback = SaveCkptCallback(
         run_name=cfg.output_model_name,
         cfg=cfg.model,
-        epoch_interval=1,
+        epoch_interval=cfg.get('save_epoch_interval', 1),
     )
 
     trainer = pl.Trainer(
