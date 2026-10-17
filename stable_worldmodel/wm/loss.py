@@ -38,6 +38,23 @@ class SIGReg(torch.nn.Module):
         return statistic.mean()  # average over projections and time
 
 
+def temporal_center(z, window):
+    """Subtract each frame's local temporal mean (TC-LeWM residuals).
+
+    The time axis is split into consecutive windows of ``window`` frames (the
+    last one may be shorter) and each window is centered on its own mean, so
+    SIGReg regularizes the residuals rather than the persistent component.
+    Reference: https://arxiv.org/abs/2607.26924
+
+    z: (B, T, ..., D)
+    """
+    if window < 2:
+        raise ValueError(f'window must be >= 2, got {window}')
+    return torch.cat(
+        [c - c.mean(1, keepdim=True) for c in z.split(window, dim=1)], dim=1
+    )
+
+
 class VCReg(torch.nn.Module):
     """Variance-Covariance Regularizer"""
 
@@ -129,4 +146,5 @@ __all__ = [
     'SIGReg',
     'TemporalStraighteningLoss',
     'VCReg',
+    'temporal_center',
 ]

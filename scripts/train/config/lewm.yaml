@@ -92,6 +92,10 @@ model:
 loss:
   sigreg:
     weight: 0.09
+    # TC-LeWM: center latents over windows of this many frames before SIGReg
+    # (null = standard SIGReg; the paper centers over the full 4-frame clip).
+    # num_steps is raised to at least this; SIGReg sees all loaded frames.
+    temporal_window: null
     kwargs:
       knots: 17
       num_proj: 1024

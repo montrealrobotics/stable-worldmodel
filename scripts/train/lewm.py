@@ -17,7 +17,7 @@ from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.planning.objective import GoalMSE
 from stable_worldmodel.wm.diagnostics import encoder_gradient_diagnostics
 from stable_worldmodel.wm.lewm.detached_rollout import detached_rollout
-from stable_worldmodel.wm.loss import SIGReg
+from stable_worldmodel.wm.loss import SIGReg, temporal_center
 from stable_worldmodel.wm.utils import (
     _resolve,
     load_pretrained,
@@ -206,6 +206,9 @@ def lejepa_forward(self, batch, stage, cfg):
     output['pred_loss'] = (pred_emb - tgt_emb).pow(2).mean()
     # Patch models retain the CLS embedding for the standard LEWM regularizer.
     reg_emb = output.get('cls_emb', emb)
+    window = cfg.loss.sigreg.get('temporal_window')
+    if window:  # TC-LeWM: regularize residuals around the local temporal mean
+        reg_emb = temporal_center(reg_emb, window)
     output['sigreg_loss'] = self.sigreg(reg_emb.transpose(0, 1))
     output['loss'] = output['pred_loss'] + lambd * output['sigreg_loss']
     search = getattr(cfg.loss, 'search', None)
@@ -248,6 +251,14 @@ def run(cfg):
     #########################
     ##       dataset       ##
     #########################
+
+    # TC-LeWM: load enough frames to fill one centering window.
+    window = cfg.loss.sigreg.get('temporal_window')
+    if window:
+        with open_dict(cfg):
+            cfg.data.dataset.num_steps = max(
+                cfg.data.dataset.num_steps, window
+            )
 
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop('name')
