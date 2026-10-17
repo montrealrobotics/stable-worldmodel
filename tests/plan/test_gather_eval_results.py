@@ -10,8 +10,8 @@ import pytest
 
 from scripts.visualization.gather_eval_results import (
     discover,
+    episode_results,
     parse_result,
-    select_videos,
     write_report,
 )
 
@@ -238,50 +238,103 @@ def test_cli_error_plots_support_eval_seeds_without_expert_metadata(tmp_path):
 
 
 @pytest.mark.parametrize('outcomes', ['True, ..., False', '', '1, 2, 0'])
-def test_incomplete_outcomes_do_not_guess_video_class(tmp_path, outcomes):
+def test_incomplete_outcomes_do_not_guess_episodes(tmp_path, outcomes):
     evaluation = parse_result(result(tmp_path, outcomes=outcomes))
     (tmp_path / 'env_0.mp4').touch()
     (tmp_path / 'episode_remaining_0.mp4').touch()
     assert evaluation.episode_successes == []
-    assert select_videos(evaluation) == {True: [], False: []}
+    assert episode_results([evaluation]) == ([], [])
 
 
-def test_video_selection_supports_both_naming_styles(tmp_path):
-    evaluation = parse_result(result(tmp_path))
-    names = [
+def test_episode_videos_support_both_naming_styles(tmp_path):
+    evaluation = parse_result(result(tmp_path, outcomes='True, False'))
+    for name in [
         'episode_0.mp4',
-        'episode_1.mp4',
-        'env_2.mp4',
-        'env_3.mp4',
+        'env_1_success_True.mp4',
         'env_99.mp4',
-        'zzz_suc_True.mp4',
-        'zzz_success_False.mp4',
+        'episode_remaining_0.mp4',
         'unknown.mp4',
-    ]
-    for name in names:
+    ]:
         (tmp_path / name).touch()
-    videos = select_videos(evaluation)
-    assert [path.name for path in videos[True]] == [
-        'env_2.mp4',
+    cases, rows = episode_results([evaluation])
+    assert cases == [(None, None, None, None, 0), (None, None, None, None, 1)]
+    assert [row[0].video.name for row in rows] == [
         'episode_0.mp4',
+        'env_1_success_True.mp4',
     ]
-    assert [path.name for path in videos[False]] == [
-        'env_3.mp4',
-        'episode_1.mp4',
+    # Recorded outcomes win over the filename.
+    assert [row[0].success for row in rows] == [True, False]
+
+
+def test_episodes_match_across_runs_by_seed_and_steps(tmp_path):
+    first = parse_result(
+        error_result(
+            tmp_path / 'cube_a',
+            """{
+        'seeds': [1, 2, 3, 4], 'start_steps': [0, 0, 0, 0],
+        'goal_steps': [5, 5, 5, 5],
+        'episode_xy_error_m': [0.1, 0.2, 0.3, 0.4]
+    }""",
+        )
+    )
+    second = parse_result(
+        error_result(
+            tmp_path / 'cube_b',
+            """{
+        'seeds': [4, 3, 2, 9], 'start_steps': [0, 0, 0, 0],
+        'goal_steps': [5, 5, 5, 5],
+        'episode_xy_error_m': [0.04, 0.03, 0.02, 0.09]
+    }""",
+        )
+    )
+    (first.source.parent / 'episode_3.mp4').touch()
+    (second.source.parent / 'episode_0.mp4').touch()
+    cases, rows = episode_results([first, second])
+    assert [case[0] for case in cases] == [1, 2, 3, 4, 9]
+    assert rows[0][1] is None and rows[4][0] is None
+    seed_4 = rows[3]
+    assert seed_4[0].errors == {'xy_error_m': 0.4}
+    assert seed_4[1].errors == {'xy_error_m': 0.04}
+    assert seed_4[0].video.parent.name == 'cube_a'
+    assert seed_4[1].video.parent.name == 'cube_b'
+    assert [r.success for r in seed_4] == [False, True]
+
+    output = tmp_path / 'report' / 'results.md'
+    write_report([first, second], output, tmp_path, 'cube_')
+    report = output.read_text()
+    assert '## Episode outcomes' in report
+    assert '### Outcomes differ across runs (3)' in report
+    assert (
+        '| [seed 4 · steps 0→5](results_episodes.md#episode-3) | 1/2 | ✗ | ✓ |'
+    ) in report
+    assert (
+        '| [seed 9 · steps 0→5](results_episodes.md#episode-4) | 0/1 |  | ✗ |'
+    ) in report
+    episodes = output.with_name('results_episodes.md').read_text()
+    assert '<a id="episode-3"></a>' in episodes
+    assert 'results_videos/run_001/episode_3.mp4' in episodes
+    assert 'results_videos/run_002/episode_0.mp4' in episodes
+    html = output.with_suffix('.html').read_text()
+    data = json.loads(re.search(r'const DATA = (.*);\n', html)[1])
+    assert [run['name'] for run in data['runs']] == ['cube_a', 'cube_b']
+    assert data['episodes'][3]['case']['seed'] == 4
+    assert data['episodes'][3]['group'] == 'differs'
+    assert [r['video'] for r in data['episodes'][3]['results']] == [
+        'results_videos/run_001/episode_3.mp4',
+        'results_videos/run_002/episode_0.mp4',
     ]
+    assert str(tmp_path) not in html
 
 
 @pytest.mark.parametrize('copy_videos', [True, False])
-def test_report_embeds_videos_and_keeps_metrics_and_config(
-    tmp_path, copy_videos
-):
+def test_report_embeds_videos_and_keeps_config(tmp_path, copy_videos):
     root = tmp_path / 'inputs'
     evaluation = parse_result(result(root / 'cube_one'))
-    for success in ('True', 'False'):
-        for index in range(3):
-            (
-                evaluation.source.parent / f'case {index}_suc_{success}.mp4'
-            ).write_bytes(b'video')
+    (evaluation.source.parent / 'case 0_suc_True.mp4').write_bytes(b'x')
+    for index in range(4):
+        (evaluation.source.parent / f'episode_{index}.mp4').write_bytes(
+            b'video'
+        )
     output = tmp_path / 'report' / 'results.md'
     write_report([evaluation], output, root, 'cube_', copy_videos=copy_videos)
     report = output.read_text()
@@ -289,28 +342,24 @@ def test_report_embeds_videos_and_keeps_metrics_and_config(
     assert '[Shared parameters](results_shared_parameters.md)' in report
     assert evaluation.source.name not in report
     assert '| Run 1 — cube_one |' in report
-    assert '### Configuration' not in report
     assert 'num_samples: 128' not in report
+    assert 'evaluation_time' not in report
     shared = output.with_name('results_shared_parameters.md').read_text()
     assert '| solver.num_samples | 128 |' in shared
     assert '| policy | models/checkpoint.pt |' in shared
     assert '[Back to evaluation results](results.md)' in shared
-    assert re.findall(r'(?<!!)\[[^\]\n]+\]\(([^\n]+)\)', report + shared) == [
-        'results_shared_parameters.md',
-        'results.md',
-    ]
     assert str(tmp_path) not in report + shared
-    assert 'evaluation_time: 1.5 seconds' in report
+    assert '| [episode 1](results_episodes.md#episode-1) | 0/1 | ✗ |' in report
+    episodes = output.with_name('results_episodes.md').read_text()
     video_root = (
         'results_videos/run_001' if copy_videos else '../inputs/cube_one'
     )
-    video_url = f'{video_root}/case%200_suc_True.mp4'
-    assert report.count('<video controls width="640" preload="none">') == 4
-    assert report.count('</video>') == 4
-    assert f'<source src="{video_url}" type="video/mp4">' in report
+    assert episodes.count('<video controls width="320"') == 4
+    assert f'<source src="{video_root}/episode_1.mp4"' in episodes
     copied = list(output.parent.rglob('*.mp4'))
     assert len(copied) == (4 if copy_videos else 0)
     assert all(path.read_bytes() == b'video' for path in copied)
+    assert output.with_suffix('.html').is_file()
 
 
 def test_report_compares_differing_important_settings(tmp_path):
@@ -383,8 +432,6 @@ def test_cli_skips_bad_results_and_reports_missing_videos(tmp_path):
     assert completed.returncode == 0, completed.stderr
     assert 'warning: skipping' in completed.stderr
     report = output.read_text()
-    assert 'Only 0 of 2 requested failure videos available.' in report
-    assert 'Only 0 of 2 requested success videos available.' in report
     assert 'Skipped result files' in report
     assert 'cube_bad/cube_results.txt: missing CONFIG / RESULTS' in report
     assert str(tmp_path) not in report
@@ -529,11 +576,22 @@ def test_report_includes_landscapes_and_expert_selection(
     assert 'controller_scale' not in shared
     assert '## Expert-action selection' in shared
     assert expert_path.name not in report
-    assert re.findall(r'(?<!!)\[[^\]\n]+\]\(([^\n]+)\)', report + shared) == [
+    links = re.findall(r'(?<!!)\[[^\]\n]+\]\(([^\n)]+)\)', report + shared)
+    assert [link for link in links if '_episodes.md#' not in link] == [
         'results_shared_parameters.md',
         'results.md',
     ]
     assert str(tmp_path) not in report + shared
+    html = output.with_suffix('.html').read_text()
+    data = json.loads(re.search(r'const DATA = (.*);\n', html)[1])
+    assert '<h2>Action-space energy landscapes</h2>' in data['diagnostics']
+    assert '<h3>landscapes/landscape_0</h3>' in data['diagnostics']
+    assert (
+        'src="results_figures/landscape_001/landscape.png"'
+        in data['diagnostics']
+    ) == copy_assets
+    assert '<td>policy</td><td>model.pt</td>' in data['diagnostic_shared']
+    assert str(tmp_path) not in html
 
 
 def test_cli_includes_external_expert_diagnostics_and_skips_bad_json(tmp_path):

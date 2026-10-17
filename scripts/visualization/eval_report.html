@@ -1,0 +1,662 @@
+<!doctype html>
+<!-- Template for gather_eval_results.py, which fills in the DATA constant. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evaluation results</title>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --raised: #ffffff;
+  --border: rgba(11, 11, 11, 0.10);
+  --text: #0b0b0b;
+  --text-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --accent: #2a78d6;
+  --good: #0ca30c;
+  --good-text: #006300;
+  --bad: #d03b3b;
+  --missing: #f0efec;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --seq: #cde2fb, #9ec5f4, #6da7ec, #3987e5, #256abf, #184f95, #0d366b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --raised: #222221;
+    --border: rgba(255, 255, 255, 0.10);
+    --text: #f0efec; --text-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --accent: #3987e5;
+    --good-text: #0ca30c; --missing: #2c2c2a;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --seq: #104281, #184f95, #256abf, #3987e5, #6da7ec, #9ec5f4, #cde2fb;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --raised: #222221;
+  --border: rgba(255, 255, 255, 0.10);
+  --text: #f0efec; --text-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --accent: #3987e5;
+  --good-text: #0ca30c; --missing: #2c2c2a;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --seq: #104281, #184f95, #256abf, #3987e5, #6da7ec, #9ec5f4, #cde2fb;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 20px; border-bottom: 1px solid var(--border);
+  background: var(--surface); position: sticky; top: 0; z-index: 10;
+}
+header h1 { font-size: 17px; margin: 0; }
+header .meta { color: var(--text-2); }
+header .spacer { flex: 1; }
+button, select, input[type=search] {
+  font: inherit; color: var(--text); background: var(--raised);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--muted); }
+.layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); }
+aside {
+  border-right: 1px solid var(--border); background: var(--surface);
+  padding: 14px; position: sticky; top: 53px; height: calc(100vh - 53px);
+  overflow: auto;
+}
+aside h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase;
+  letter-spacing: .04em; color: var(--text-2); }
+aside .row { display: flex; gap: 6px; margin-bottom: 10px; }
+aside input[type=search] { width: 100%; }
+.group { margin-bottom: 12px; }
+.group-head { display: flex; align-items: center; gap: 6px; font-weight: 600;
+  padding: 3px 0; cursor: pointer; }
+.run { display: flex; align-items: center; gap: 6px; padding: 2px 0 2px 18px;
+  cursor: pointer; color: var(--text-2); }
+.run:hover { color: var(--text); }
+.run .rate { margin-left: auto; font-variant-numeric: tabular-nums;
+  color: var(--muted); font-size: 12px; }
+.swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+main { padding: 16px 20px 60px; min-width: 0; }
+.panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px; margin-bottom: 16px;
+}
+.panel > h2 { font-size: 16px; margin: 0 0 4px; }
+.panel > .note { color: var(--text-2); margin: 0 0 10px; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-bottom: 10px; }
+.controls label { color: var(--text-2); }
+#episode { min-width: 0; max-width: min(520px, calc(100vw - 120px)); }
+.charts { display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); }
+.chart { min-height: 260px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 6px;
+  color: var(--text-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border);
+  white-space: nowrap; }
+th { color: var(--text-2); font-weight: 600; position: sticky; top: 0;
+  background: var(--surface); }
+th.sortable { cursor: pointer; }
+th.sortable:hover { color: var(--text); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.best { font-weight: 700; text-decoration: underline; }
+.summary { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.chip { border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px;
+  background: var(--raised); cursor: pointer; color: var(--text-2); }
+.chip.on { border-color: var(--accent); color: var(--text); }
+.chip b { color: var(--text); }
+.videos { display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+.card { border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+  background: var(--raised); }
+.card.focus { outline: 2px solid var(--accent); }
+.card video { width: 100%; border-radius: 4px; background: #000; display: block; }
+.card .head { display: flex; align-items: center; gap: 6px; margin: 6px 0 2px;
+  font-weight: 600; }
+.card .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card .group-name { color: var(--muted); font-size: 12px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.card .errors { color: var(--text-2); font-size: 12px;
+  font-variant-numeric: tabular-nums; }
+.badge { margin-left: auto; font-size: 12px; font-weight: 600; flex: none; }
+.badge.ok { color: var(--good-text); }
+.badge.fail { color: var(--bad); }
+.novideo { aspect-ratio: 1; display: grid; place-items: center;
+  color: var(--muted); background: var(--missing); border-radius: 4px; }
+details > summary { cursor: pointer; font-weight: 600; }
+.diagnostics img { max-width: 100%; }
+.diagnostics video { max-width: 100%; }
+.empty { color: var(--muted); }
+@media (max-width: 800px) {
+  .layout { grid-template-columns: 1fr; }
+  aside { position: static; height: auto; border-right: 0;
+    border-bottom: 1px solid var(--border); max-height: 50vh; }
+  main { padding: 12px 16px 40px; }
+  header { position: static; padding: 10px 16px; }
+  .charts { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Evaluation results</h1>
+  <span class="meta" id="meta"></span>
+  <span class="spacer"></span>
+  <button id="theme" title="Switch theme">Theme: auto</button>
+</header>
+<div class="layout">
+  <aside>
+    <h2>Runs</h2>
+    <div class="row"><input type="search" id="filter" placeholder="Filter runs (regex)"></div>
+    <div class="row">
+      <button id="all">All</button><button id="none">None</button>
+      <span id="count" class="meta" style="align-self:center;color:var(--muted)"></span>
+    </div>
+    <div id="runs"></div>
+  </aside>
+  <main>
+    <section class="panel">
+      <h2>Success rate and mean errors</h2>
+      <p class="note">One line per model; runs named &lt;model&gt;_ep&lt;N&gt; are plotted by epoch. Lower error is better.</p>
+      <div class="legend" id="overview-legend"></div>
+      <div class="charts" id="overview"></div>
+    </section>
+    <section class="panel">
+      <h2>Runs</h2>
+      <p class="note">Selected runs. Click a column to sort; the best value per column is underlined. Only differing settings are shown.</p>
+      <div class="table-wrap" id="table"></div>
+    </section>
+    <section class="panel" id="episodes-panel">
+      <h2>Episode outcomes</h2>
+      <p class="note">Same episodes across runs, matched by eval seed, expert seed and start/goal steps. Each row is one episode, each column one run; ✓ marks a success. Click a cell to watch that episode from every run.</p>
+      <div class="summary" id="groups"></div>
+      <div class="controls">
+        <label for="color-by">Color by</label>
+        <select id="color-by"></select>
+      </div>
+      <div id="matrix"></div>
+    </section>
+    <section class="panel" id="scatter-panel">
+      <h2>Per-episode final error</h2>
+      <p class="note">Each point is one run on one episode. Filled = success, hollow = failure.</p>
+      <div class="controls">
+        <label for="scatter-metric">Metric</label>
+        <select id="scatter-metric"></select>
+      </div>
+      <div class="legend" id="scatter-legend"></div>
+      <div id="scatter"></div>
+    </section>
+    <section class="panel" id="viewer-panel">
+      <h2>Episode viewer</h2>
+      <p class="note" id="viewer-note"></p>
+      <div class="controls">
+        <button id="prev" title="Previous episode">◀</button>
+        <select id="episode"></select>
+        <button id="next" title="Next episode">▶</button>
+        <label for="show">Show</label>
+        <select id="show">
+          <option value="all">all runs</option>
+          <option value="fail">failures</option>
+          <option value="ok">successes</option>
+        </select>
+        <button id="play">Play all</button>
+        <button id="pause">Pause</button>
+        <button id="restart">Restart</button>
+        <label for="speed">Speed</label>
+        <select id="speed">
+          <option>0.25</option><option>0.5</option><option selected>1</option><option>2</option>
+        </select>
+      </div>
+      <div class="videos" id="videos"></div>
+    </section>
+    <section class="panel">
+      <details>
+        <summary>Shared parameters</summary>
+        <p class="note">Settings with the same value in every evaluation.</p>
+        <div class="table-wrap" id="shared"></div>
+        <div class="diagnostics" id="diagnostic-shared"></div>
+      </details>
+    </section>
+    <section class="panel diagnostics" id="diagnostics"></section>
+    <section class="panel" id="warnings"></section>
+  </main>
+</div>
+<script>
+const DATA = __REPORT_DATA__;
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const fmt = (v) => v == null ? '—' : Number(v).toPrecision(4).replace(/\.?0+(e|$)/, '$1');
+const store = {
+  get(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} },
+};
+
+const runs = DATA.runs;
+const metrics = Object.entries(DATA.metrics)
+  .filter(([key]) => runs.some((r) => key in r.means) ||
+    DATA.episodes.some((e) => e.results.some((x) => x && key in x.errors)));
+const groups = [...new Set(runs.map((r) => r.group))];
+const byEpoch = runs.every((r) => r.epoch != null);
+const colorOf = (run) => {
+  const slot = groups.indexOf(run.group);
+  return slot < 8 ? css(`--s${slot + 1}`) : css('--muted');
+};
+const runLabel = (r) => r.epoch != null ? `ep${r.epoch}` : `Run ${r.id}`;
+const shortCase = (e) => {
+  const c = e.case;
+  if (c.seed == null) return `ep ${c.index}`;
+  let s = `s${c.seed}`;
+  if (c.start != null && c.goal != null) s += ` ${c.start}→${c.goal}`;
+  return s;
+};
+
+const selectionKey = 'selected:' + runs.map((r) => r.name).join('|');
+let selected = new Set(store.get(selectionKey) ?? runs.map((r) => r.id));
+selected = new Set([...selected].filter((id) => runs.some((r) => r.id === id)));
+if (!selected.size) selected = new Set(runs.map((r) => r.id));
+let filterText = '';
+let focus = {episode: null, run: null};
+// Display order: by model group, then epoch (run names sort ep100 before ep15).
+const ordered = [...runs].sort((a, b) =>
+  groups.indexOf(a.group) - groups.indexOf(b.group) || (a.epoch ?? a.id) - (b.epoch ?? b.id));
+const visibleRuns = () => ordered.filter((r) => selected.has(r.id));
+
+// ---------- sidebar ----------
+function matchesFilter(run) {
+  if (!filterText) return true;
+  try { return new RegExp(filterText, 'i').test(run.name); }
+  catch { return run.name.toLowerCase().includes(filterText.toLowerCase()); }
+}
+function renderSidebar() {
+  const html = groups.map((group) => {
+    const members = runs.filter((r) => r.group === group && matchesFilter(r))
+      .sort((a, b) => (a.epoch ?? a.id) - (b.epoch ?? b.id));
+    if (!members.length) return '';
+    const all = members.every((r) => selected.has(r.id));
+    return `<div class="group">
+      <label class="group-head"><input type="checkbox" data-group="${esc(group)}" ${all ? 'checked' : ''}>
+        <span class="swatch" style="background:${colorOf(members[0])}"></span>${esc(group)}</label>
+      ${members.map((r) => `<label class="run" title="${esc(r.name)}">
+        <input type="checkbox" data-run="${r.id}" ${selected.has(r.id) ? 'checked' : ''}>
+        ${r.epoch != null ? `ep${r.epoch}` : `Run ${r.id}`}
+        <span class="rate">${r.success_rate.toFixed(1)}%</span></label>`).join('')}
+    </div>`;
+  }).join('');
+  $('runs').innerHTML = html || '<p class="empty">No runs match.</p>';
+  $('count').textContent = `${selected.size}/${runs.length} selected`;
+}
+$('runs').addEventListener('change', (event) => {
+  const box = event.target;
+  if (box.dataset.run) {
+    box.checked ? selected.add(+box.dataset.run) : selected.delete(+box.dataset.run);
+  } else if (box.dataset.group != null) {
+    runs.filter((r) => r.group === box.dataset.group && matchesFilter(r))
+      .forEach((r) => box.checked ? selected.add(r.id) : selected.delete(r.id));
+  }
+  update();
+});
+$('filter').addEventListener('input', (event) => { filterText = event.target.value; renderSidebar(); });
+$('all').onclick = () => { runs.filter(matchesFilter).forEach((r) => selected.add(r.id)); update(); };
+$('none').onclick = () => { runs.filter(matchesFilter).forEach((r) => selected.delete(r.id)); update(); };
+
+// ---------- plotly helpers ----------
+function baseLayout(extra = {}) {
+  const ink = css('--text-2');
+  const axis = {gridcolor: css('--grid'), linecolor: css('--axis'), zerolinecolor: css('--axis'),
+    tickfont: {color: ink, size: 11}, title: {font: {color: ink, size: 12}}, automargin: true};
+  return {
+    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+    font: {family: 'system-ui, -apple-system, "Segoe UI", sans-serif', color: css('--text'), size: 12},
+    margin: {l: 56, r: 12, t: 30, b: 44}, showlegend: false,
+    hoverlabel: {bgcolor: css('--raised'), bordercolor: css('--border'), font: {color: css('--text')}},
+    xaxis: {...axis, ...(extra.xaxis || {})}, yaxis: {...axis, ...(extra.yaxis || {})},
+    ...Object.fromEntries(Object.entries(extra).filter(([k]) => k !== 'xaxis' && k !== 'yaxis')),
+  };
+}
+const config = {displaylogo: false, responsive: true,
+  modeBarButtonsToRemove: ['lasso2d', 'select2d', 'autoScale2d']};
+function legendHtml(list) {
+  return list.map((group) => {
+    const run = runs.find((r) => r.group === group);
+    return `<span><span class="swatch" style="background:${colorOf(run)}"></span>${esc(group)}</span>`;
+  }).join('');
+}
+
+// ---------- overview ----------
+function renderOverview() {
+  const vis = visibleRuns();
+  const shown = groups.filter((g) => vis.some((r) => r.group === g));
+  $('overview-legend').innerHTML = shown.length > 1 ? legendHtml(shown) : '';
+  const panels = [['success_rate', 'Success rate (%)'], ...metrics.map(([k, label]) => [k, `Mean ${label}`])];
+  $('overview').innerHTML = panels.map(([key]) => `<div class="chart" id="ov-${key}"></div>`).join('');
+  for (const [key, label] of panels) {
+    const value = (r) => key === 'success_rate' ? r.success_rate : r.means[key];
+    const traces = shown.map((group) => {
+      const pts = vis.filter((r) => r.group === group && value(r) != null)
+        .sort((a, b) => (a.epoch ?? a.id) - (b.epoch ?? b.id));
+      const color = colorOf(pts[0] || runs.find((r) => r.group === group));
+      return {
+        type: 'scatter', mode: 'lines+markers', name: group,
+        x: pts.map((r) => byEpoch ? r.epoch : r.id), y: pts.map(value),
+        line: {color, width: 2}, marker: {color, size: 8, line: {color: css('--surface'), width: 2}},
+        customdata: pts.map((r) => r.name),
+        hovertemplate: `%{customdata}<br>${esc(label)}: %{y:.4g}<extra></extra>`,
+      };
+    });
+    Plotly.react(`ov-${key}`, traces, baseLayout({
+      title: {text: label, font: {size: 13}, x: 0, xanchor: 'left'},
+      xaxis: {title: {text: byEpoch ? 'Epoch' : 'Run'}},
+      yaxis: {rangemode: 'tozero'}, height: 280,
+    }), config);
+  }
+}
+
+// ---------- runs table ----------
+let sort = {key: 'id', dir: 1};
+function renderTable() {
+  const vis = visibleRuns();
+  if (!vis.length) { $('table').innerHTML = '<p class="empty">No runs selected.</p>'; return; }
+  const cols = [
+    {key: 'id', label: 'Run', get: (r) => ordered.indexOf(r), show: (r) =>
+      `<span class="swatch" style="display:inline-block;background:${colorOf(r)}"></span> ${esc(r.name)}`},
+    {key: 'success_rate', label: 'Success (%)', num: true, best: 'max', get: (r) => r.success_rate, show: (r) => r.success_rate.toFixed(2)},
+    ...metrics.map(([k, label]) => ({key: k, label: `Mean ${label}`, num: true, best: 'min',
+      get: (r) => r.means[k], show: (r) => fmt(r.means[k])})),
+    ...DATA.differing.map((k) => ({key: `p:${k}`, label: k, get: (r) => r.params[k], show: (r) => esc(r.params[k])})),
+  ];
+  const col = cols.find((c) => c.key === sort.key) || cols[0];
+  const rows = [...vis].sort((a, b) => {
+    const x = col.get(a), y = col.get(b);
+    if (x == null) return 1; if (y == null) return -1;
+    return (x > y ? 1 : x < y ? -1 : 0) * sort.dir;
+  });
+  const best = Object.fromEntries(cols.filter((c) => c.best).map((c) => {
+    const vals = vis.map(c.get).filter((v) => v != null);
+    return [c.key, vals.length > 1 ? Math[c.best](...vals) : null];
+  }));
+  $('table').innerHTML = `<table><thead><tr>${cols.map((c) =>
+    `<th class="sortable" data-key="${esc(c.key)}">${esc(c.label)}${c.key === sort.key ? (sort.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}
+    </tr></thead><tbody>${rows.map((r) => `<tr>${cols.map((c) => {
+      const v = c.get(r);
+      const cls = [c.num ? 'num' : '', c.best && v != null && v === best[c.key] ? 'best' : ''].join(' ');
+      return `<td class="${cls}">${c.show(r)}</td>`;
+    }).join('')}</tr>`).join('')}</tbody></table>`;
+}
+$('table').addEventListener('click', (event) => {
+  const th = event.target.closest('th[data-key]');
+  if (!th) return;
+  sort = {key: th.dataset.key, dir: sort.key === th.dataset.key ? -sort.dir : 1};
+  renderTable();
+});
+
+// ---------- episodes ----------
+const GROUP_LABELS = {differs: 'Outcomes differ', failed: 'Failed in every run',
+  succeeded: 'Succeeded in every run', unknown: 'Outcome not recorded'};
+let groupFilter = new Set(['differs', 'failed', 'succeeded', 'unknown']);
+function episodeStats(e, vis) {
+  const res = vis.map((r) => e.results[r.id - 1]).filter((x) => x && x.success != null);
+  const ok = res.filter((x) => x.success).length;
+  const group = !res.length ? 'unknown' : ok === res.length ? 'succeeded' : ok ? 'differs' : 'failed';
+  return {ok, n: res.length, group};
+}
+function orderedEpisodes(vis) {
+  const order = Object.keys(GROUP_LABELS);
+  return DATA.episodes.map((e, i) => ({e, i, ...episodeStats(e, vis)}))
+    .sort((a, b) => order.indexOf(a.group) - order.indexOf(b.group) || a.ok / (a.n || 1) - b.ok / (b.n || 1) || a.i - b.i);
+}
+function renderGroups(list) {
+  const counts = {};
+  list.forEach((x) => { counts[x.group] = (counts[x.group] || 0) + 1; });
+  $('groups').innerHTML = Object.entries(GROUP_LABELS).filter(([k]) => counts[k]).map(([k, label]) =>
+    `<span class="chip ${groupFilter.has(k) ? 'on' : ''}" data-group="${k}">${label}: <b>${counts[k]}</b></span>`).join('');
+}
+$('groups').addEventListener('click', (event) => {
+  const chip = event.target.closest('[data-group]');
+  if (!chip) return;
+  const k = chip.dataset.group;
+  groupFilter.has(k) ? groupFilter.delete(k) : groupFilter.add(k);
+  renderEpisodes();
+});
+function hoverText(run, e, x) {
+  if (!x) return `${esc(run.name)}<br>${esc(e.label)}<br>not evaluated`;
+  const outcome = x.success == null ? 'unknown' : x.success ? '✓ success' : '✗ failure';
+  return `${esc(run.name)}<br>${esc(e.label)}<br>${outcome}` +
+    metrics.filter(([k]) => k in x.errors).map(([k, l]) => `<br>${esc(l)}: ${fmt(x.errors[k])}`).join('');
+}
+function renderEpisodes() {
+  const vis = visibleRuns();
+  const all = orderedEpisodes(vis);
+  renderGroups(all);
+  const list = all.filter((x) => groupFilter.has(x.group));
+  renderMatrix(vis, list);
+  renderScatter(vis, list);
+  renderViewerOptions(vis, all);
+}
+function renderMatrix(vis, list) {
+  if (!DATA.episodes.length || !vis.length || !list.length) {
+    Plotly.purge('matrix');
+    $('matrix').innerHTML = `<p class="empty">${DATA.episodes.length ? 'Nothing to show for this selection.' : 'No per-episode results recorded.'}</p>`;
+    return;
+  }
+  $('matrix').querySelector('p')?.remove();
+  const mode = $('color-by').value;
+  const x = vis.map((r) => r.id);
+  const ticktext = vis.map((r) => `<span style="color:${colorOf(r)}">${r.epoch != null ? 'ep' + r.epoch : 'R' + r.id}</span>`);
+  const y = list.map((row) => `${shortCase(row.e)} (${row.ok}/${row.n})`);
+  const cellOf = (row, run) => row.e.results[run.id - 1];
+  const z = list.map((row) => vis.map((run) => {
+    const c = cellOf(row, run);
+    if (!c) return null;
+    if (mode === 'outcome') return c.success == null ? null : +c.success;
+    return c.errors[mode] ?? null;
+  }));
+  const text = list.map((row) => vis.map((run) => {
+    const c = cellOf(row, run);
+    return c && c.success ? '✓' : '';
+  }));
+  const seq = css('--seq').split(',').map((s) => s.trim());
+  const colorscale = mode === 'outcome'
+    ? [[0, css('--bad')], [0.5, css('--bad')], [0.5, css('--good')], [1, css('--good')]]
+    : seq.map((c, i) => [i / (seq.length - 1), c]);
+  const label = mode === 'outcome' ? 'Outcome' : DATA.metrics[mode];
+  Plotly.react('matrix', [{
+    type: 'heatmap', x, y, z, text, texttemplate: '%{text}',
+    textfont: {color: mode === 'outcome' ? '#ffffff' : css('--text'), size: 11},
+    customdata: list.map((row) => vis.map((run) => hoverText(run, row.e, cellOf(row, run)))),
+    hovertemplate: '%{customdata}<extra></extra>', hoverongaps: false,
+    colorscale, xgap: 2, ygap: 2,
+    zmin: mode === 'outcome' ? 0 : undefined, zmax: mode === 'outcome' ? 1 : undefined,
+    showscale: mode !== 'outcome',
+    colorbar: {title: {text: label, side: 'right', font: {color: css('--text-2')}},
+      tickfont: {color: css('--text-2')}, thickness: 12, outlinewidth: 0},
+  }], baseLayout({
+    height: Math.max(220, list.length * 24 + 110),
+    margin: {l: 140, r: 20, t: 10, b: 70},
+    xaxis: {type: 'category', tickvals: x, ticktext, tickangle: -45, showgrid: false, title: {text: 'Run'}},
+    yaxis: {type: 'category', autorange: 'reversed', showgrid: false},
+  }), config);
+  const node = $('matrix');
+  node.removeAllListeners?.('plotly_click');
+  node.on('plotly_click', (event) => {
+    const point = event.points[0];
+    const row = list[point.pointIndex[0]];
+    focus = {episode: row.i, run: vis[point.pointIndex[1]].id};
+    $('episode').value = row.i;
+    renderViewer();
+    $('viewer-panel').scrollIntoView({behavior: 'smooth'});
+  });
+}
+function renderScatter(vis, list) {
+  const metric = $('scatter-metric').value;
+  if (!metric || !vis.length || !list.length) {
+    $('scatter-panel').style.display = metric ? '' : 'none';
+    Plotly.purge('scatter');
+    return;
+  }
+  const shown = groups.filter((g) => vis.some((r) => r.group === g));
+  $('scatter-legend').innerHTML = shown.length > 1 ? legendHtml(shown) : '';
+  const cats = list.map((row) => shortCase(row.e));
+  const traces = [];
+  for (const group of shown) {
+    const pts = [];
+    for (const run of vis.filter((r) => r.group === group)) {
+      list.forEach((row, k) => {
+        const c = row.e.results[run.id - 1];
+        if (c && c.errors[metric] != null) pts.push({k, run, c, row});
+      });
+    }
+    const color = colorOf(runs.find((r) => r.group === group));
+    traces.push({
+      type: 'scatter', mode: 'markers', name: group,
+      x: pts.map((p) => cats[p.k]), y: pts.map((p) => p.c.errors[metric]),
+      marker: {color, size: 8, symbol: pts.map((p) => p.c.success ? 'circle' : 'circle-open'),
+        line: {color, width: 2}},
+      customdata: pts.map((p) => [hoverText(p.run, p.row.e, p.c), p.row.i, p.run.id]),
+      hovertemplate: '%{customdata[0]}<extra></extra>',
+    });
+  }
+  Plotly.react('scatter', traces, baseLayout({
+    height: 360, scattermode: 'group', scattergap: 0.5,
+    xaxis: {type: 'category', categoryorder: 'array', categoryarray: cats, tickangle: -45, title: {text: 'Episode (seed, start→goal)'}},
+    yaxis: {title: {text: DATA.metrics[metric]}, rangemode: 'tozero'},
+  }), config);
+  const node = $('scatter');
+  node.removeAllListeners?.('plotly_click');
+  node.on('plotly_click', (event) => {
+    const [, episode, run] = event.points[0].customdata;
+    focus = {episode, run};
+    $('episode').value = episode;
+    renderViewer();
+    $('viewer-panel').scrollIntoView({behavior: 'smooth'});
+  });
+}
+
+// ---------- viewer ----------
+function renderViewerOptions(vis, all) {
+  const current = $('episode').value;
+  const order = Object.keys(GROUP_LABELS);
+  $('episode').innerHTML = order.map((g) => {
+    const items = all.filter((x) => x.group === g);
+    if (!items.length) return '';
+    return `<optgroup label="${GROUP_LABELS[g]}">${items.map((x) =>
+      `<option value="${x.i}">${esc(x.e.label)} — ${x.ok}/${x.n} succeed</option>`).join('')}</optgroup>`;
+  }).join('');
+  if (current !== '' && [...$('episode').options].some((o) => o.value === current)) $('episode').value = current;
+  renderViewer();
+}
+function renderViewer() {
+  const vis = visibleRuns();
+  const index = $('episode').value;
+  if (index === '' || !DATA.episodes.length) {
+    $('viewer-panel').style.display = DATA.episodes.length ? '' : 'none';
+    $('videos').innerHTML = '<p class="empty">No episode selected.</p>';
+    return;
+  }
+  const e = DATA.episodes[+index];
+  const show = $('show').value;
+  const stats = episodeStats(e, vis);
+  $('viewer-note').textContent = `${e.label}: ${stats.ok} of ${stats.n} selected runs succeed. Videos play in sync with “Play all”.`;
+  const cards = vis.map((run) => ({run, c: e.results[run.id - 1]}))
+    .filter(({c}) => c && (show === 'all' || (show === 'ok') === !!c.success));
+  $('videos').innerHTML = cards.map(({run, c}) => `
+    <div class="card ${focus.episode === +index && focus.run === run.id ? 'focus' : ''}" data-run="${run.id}">
+      ${c.video ? `<video src="${esc(c.video)}" preload="metadata" muted playsinline loop controls></video>`
+                : '<div class="novideo">No video</div>'}
+      <div class="head"><span class="swatch" style="background:${colorOf(run)}"></span>
+        <span class="name" title="${esc(run.name)}">${esc(runLabel(run))}</span>
+        <span class="badge ${c.success ? 'ok' : 'fail'}">${c.success == null ? '?' : c.success ? '✓ Success' : '✗ Failure'}</span></div>
+      <div class="group-name" title="${esc(run.name)}">${esc(run.group)}</div>
+      <div class="errors">${metrics.filter(([k]) => k in c.errors).map(([k, l]) => `${esc(l)}: ${fmt(c.errors[k])}`).join('<br>')}</div>
+    </div>`).join('') || '<p class="empty">No runs to show.</p>';
+  applySpeed();
+  document.querySelector('.card.focus')?.scrollIntoView({block: 'nearest'});
+}
+const videos = () => [...$('videos').querySelectorAll('video')];
+function applySpeed() { videos().forEach((v) => { v.playbackRate = +$('speed').value; }); }
+$('play').onclick = () => { videos().forEach((v) => { v.currentTime = 0; v.play().catch(() => {}); }); };
+$('pause').onclick = () => videos().forEach((v) => v.pause());
+$('restart').onclick = () => videos().forEach((v) => { v.currentTime = 0; });
+$('speed').onchange = applySpeed;
+$('show').onchange = renderViewer;
+$('episode').onchange = () => { focus = {episode: null, run: null}; renderViewer(); };
+function step(delta) {
+  const options = [...$('episode').options];
+  const k = options.findIndex((o) => o.selected);
+  const next = options[(k + delta + options.length) % options.length];
+  if (next) { $('episode').value = next.value; focus = {episode: null, run: null}; renderViewer(); }
+}
+$('prev').onclick = () => step(-1);
+$('next').onclick = () => step(1);
+document.addEventListener('keydown', (event) => {
+  if (event.target.matches('input, select, textarea')) return;
+  if (event.key === 'ArrowLeft') step(-1);
+  if (event.key === 'ArrowRight') step(1);
+});
+
+// ---------- static sections ----------
+function renderStatic() {
+  const shared = Object.entries(DATA.shared);
+  $('shared').innerHTML = shared.length
+    ? `<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>${shared.map(([k, v]) =>
+        `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join('')}</tbody></table>`
+    : '<p class="empty">No parameters are shared across all evaluations.</p>';
+  $('diagnostic-shared').innerHTML = DATA.diagnostic_shared;
+  $('diagnostics').innerHTML = DATA.diagnostics;
+  $('diagnostics').style.display = DATA.diagnostics ? '' : 'none';
+  $('warnings').innerHTML = DATA.warnings.length
+    ? `<h2>Skipped result files</h2><ul>${DATA.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : '';
+  $('warnings').style.display = DATA.warnings.length ? '' : 'none';
+  $('meta').textContent = `${runs.length} runs · ${DATA.episodes.length} episodes · prefix “${DATA.prefix}”`;
+  $('color-by').innerHTML = `<option value="outcome">Outcome</option>` +
+    metrics.map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('');
+  $('scatter-metric').innerHTML = metrics.map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('');
+  $('color-by').onchange = renderEpisodes;
+  $('scatter-metric').onchange = renderEpisodes;
+}
+
+// ---------- theme ----------
+const THEMES = ['auto', 'light', 'dark'];
+let theme = store.get('theme') || 'auto';
+function applyTheme() {
+  if (theme === 'auto') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+  $('theme').textContent = `Theme: ${theme}`;
+}
+$('theme').onclick = () => {
+  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  store.set('theme', theme);
+  applyTheme();
+  update();
+};
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => update());
+
+function update() {
+  store.set(selectionKey, [...selected]);
+  renderSidebar();
+  renderOverview();
+  renderTable();
+  renderEpisodes();
+}
+applyTheme();
+renderStatic();
+update();
+</script>
+</body>
+</html>

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Collect prefixed evaluation directories into a Markdown comparison report.
+"""Collect prefixed evaluation directories into comparison reports.
 
 Example (run from the repository root)::
 
     python scripts/visualization/gather_eval_results.py /path/to/checkpoints \
         --prefix cube_ --output results.md
 
-Searches recursively, uses the latest record in each *_results.txt file, and
-copies up to two success and two failure videos per evaluation beside the
-report. Shared settings go into a linked *_shared_parameters.md file; the
-main report compares differing model, planning, and evaluation parameters.
+Searches recursively, uses the latest record in each *_results.txt file and
+writes two reports beside each other: results.html, an interactive report
+(run selector, error charts, episode × run outcome matrix and a synced
+episode video viewer; loads plotly.js from a CDN), and results.md with static
+plots. Episodes are matched across runs by seeds and start/goal steps, and
+results_episodes.md shows each episode's videos from every run side by side.
+Episode videos are copied beside the reports. Shared settings go into a
+linked *_shared_parameters.md file; the reports compare differing model,
+planning, and evaluation parameters.
 Add --landscape-dir and --expert-dir to include saved diagnostic experiments.
 Reports use run names and short filenames instead of absolute local paths.
 Episode errors are compared by expert/eval seed, with mean errors per run.
@@ -29,13 +34,17 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import yaml
 
 NUMBER = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?'
-OUTCOME = re.compile(r'(?:success_|suc_)(true|false)\.mp4$', re.IGNORECASE)
-INDEX = re.compile(r'^(?:episode|env)_(\d+)\.mp4$', re.IGNORECASE)
+# Episode videos: episode_<i>.mp4 or env_<i>[_success_<bool>].mp4.
+VIDEO = re.compile(
+    r'^(?:episode|env)_(\d+)(?:_(?:success|suc)_(true|false))?\.mp4$',
+    re.IGNORECASE,
+)
+CASE_KEYS = ('seeds', 'expert_seeds', 'start_steps', 'goal_steps')
 RECORD = re.compile(
     r'^==== CONFIG ====\s*\n(.*?)^==== RESULTS ====\s*\n(.*?)(?='
     r'^==== CONFIG ====|\Z)',
@@ -68,6 +77,13 @@ class Evaluation:
     record_count: int
     metric_arrays: dict[str, list[int | float]] = field(default_factory=dict)
     mean_errors: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class EpisodeResult:
+    success: bool | None
+    errors: dict[str, float]
+    video: Path | None
 
 
 def numeric_array(text: str, key: str) -> list[int | float]:
@@ -192,23 +208,251 @@ def discover(root: Path, prefix: str, result_pattern: str) -> list[Path]:
     )
 
 
-def select_videos(evaluation: Evaluation) -> dict[bool, list[Path]]:
-    """Select two videos per outcome, in filename order, from the same run."""
-    selected: dict[bool, list[Path]] = {True: [], False: []}
-    for path in sorted(evaluation.source.parent.glob('*.mp4')):
-        match = OUTCOME.search(path.name)
-        if match:
-            success = match.group(1).lower() == 'true'
+def episode_cases(evaluation: Evaluation) -> list[tuple]:
+    """Identify episodes by seeds and start/goal steps, else by index."""
+    arrays = evaluation.metric_arrays
+    count = len(evaluation.episode_successes) or max(
+        (
+            len(values)
+            for key, values in arrays.items()
+            if key.startswith('episode_')
+        ),
+        default=0,
+    )
+    columns = [arrays.get(key) for key in CASE_KEYS]
+    if columns[0] and all(
+        values is None
+        or len(values) == count
+        and all(math.isfinite(v) and int(v) == v for v in values)
+        for values in columns
+    ):
+        return [
+            (*(None if v is None else int(v[i]) for v in columns), None)
+            for i in range(count)
+        ]
+    return [(None, None, None, None, i) for i in range(count)]
+
+
+def case_label(case: tuple) -> str:
+    seed, expert, start, goal, index = case
+    if seed is None:
+        return f'episode {index}'
+    label = f'seed {seed}'
+    if expert is not None and expert != seed:
+        label += f' / expert {expert}'
+    if start is not None and goal is not None:
+        label += f' · steps {start}→{goal}'
+    return label
+
+
+def episode_results(
+    evaluations: list[Evaluation],
+) -> tuple[list[tuple], list[list[EpisodeResult | None]]]:
+    """Align episodes across runs; rows are cases, columns are runs."""
+    per_run = []
+    for evaluation in evaluations:
+        cases = episode_cases(evaluation)
+        arrays = evaluation.metric_arrays
+        outcomes = evaluation.episode_successes
+        videos: dict[int, tuple[Path, bool | None]] = {}
+        for path in sorted(evaluation.source.parent.glob('*.mp4')):
+            match = VIDEO.match(path.name)
+            if match:
+                outcome = match[2] and match[2].lower() == 'true'
+                videos[int(match[1])] = (path, outcome)
+        results: dict[tuple, EpisodeResult] = {}
+        for index, case in enumerate(cases):
+            video, outcome = videos.get(index, (None, None))
+            errors = {
+                key: values[index]
+                for key in ERROR_METRICS
+                if len(values := arrays.get(f'episode_{key}', []))
+                == len(cases)
+                and math.isfinite(values[index])
+            }
+            results.setdefault(
+                case,
+                EpisodeResult(
+                    outcomes[index] if index < len(outcomes) else outcome,
+                    errors,
+                    video,
+                ),
+            )
+        per_run.append(results)
+    cases = sorted(
+        set().union(*per_run),
+        key=lambda case: tuple(-math.inf if v is None else v for v in case),
+    )
+    return cases, [
+        [results.get(case) for results in per_run] for case in cases
+    ]
+
+
+def outcome_group(results: list[EpisodeResult | None]) -> str:
+    outcomes = {r.success for r in results if r and r.success is not None}
+    if outcomes == {True, False}:
+        return 'differs'
+    return {frozenset({False}): 'failed', frozenset({True}): 'succeeded'}.get(
+        frozenset(outcomes), 'unknown'
+    )
+
+
+OUTCOME_GROUPS = {
+    'differs': 'Outcomes differ across runs',
+    'failed': 'Failed in every run',
+    'succeeded': 'Succeeded in every run',
+    'unknown': 'Outcome not recorded',
+}
+
+
+def copy_asset(source: Path, target: Path, copy: bool) -> Path:
+    if not copy:
+        return source
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() != target.resolve():
+        shutil.copy2(source, target)
+    return target
+
+
+def outcome_mark(result: EpisodeResult | None) -> str:
+    if result is None or result.success is None:
+        return ''
+    return '✓' if result.success else '✗'
+
+
+def episode_lines(
+    cases: list[tuple],
+    rows: list[list[EpisodeResult | None]],
+    output: Path,
+    episodes_path: Path,
+) -> list[str]:
+    """Outcome matrix with one row per shared episode, grouped by agreement."""
+    if not cases:
+        return []
+    groups: dict[str, list[int]] = {key: [] for key in OUTCOME_GROUPS}
+    for index, results in enumerate(rows):
+        groups[outcome_group(results)].append(index)
+    runs = len(rows[0])
+    summary = ', '.join(
+        f'{len(groups[key])} {label[0].lower()}{label[1:]}'
+        for key, label in OUTCOME_GROUPS.items()
+        if groups[key]
+    )
+    lines = [
+        '',
+        '## Episode outcomes',
+        '',
+        (
+            'Episodes are matched across runs by eval seed, expert seed and '
+            'start/goal steps (by index when seeds are missing). ✓ success, '
+            '✗ failure, blank means the run has no such episode. Click an '
+            'episode for its videos from every run side by side.'
+        ),
+        '',
+        f'{len(cases)} episodes: {summary}.',
+    ]
+    header = [
+        'Episode',
+        'Successes',
+        *(f'Run {i}' for i in range(1, runs + 1)),
+    ]
+    for key, label in OUTCOME_GROUPS.items():
+        if not groups[key]:
+            continue
+        table = [
+            '| ' + ' | '.join(header) + ' |',
+            '| --- | ---: |' + ' :---: |' * runs,
+        ]
+        for index in groups[key]:
+            results = rows[index]
+            known = [r for r in results if r and r.success is not None]
+            link = f'{relative_url(episodes_path, output)}#episode-{index}'
+            table.append(
+                f'| [{cell(case_label(cases[index]))}]({link}) '
+                f'| {sum(r.success for r in known)}/{len(known)} | '
+                + ' | '.join(outcome_mark(r) for r in results)
+                + ' |'
+            )
+        title = f'{label} ({len(groups[key])})'
+        if key == 'succeeded':
+            lines.extend(
+                ['', '<details>', f'<summary>{title}</summary>', '', *table]
+            )
+            lines.extend(['', '</details>'])
         else:
-            match = INDEX.match(path.name)
-            if not match or int(match.group(1)) >= len(
-                evaluation.episode_successes
-            ):
-                continue
-            success = evaluation.episode_successes[int(match.group(1))]
-        if len(selected[success]) < 2:
-            selected[success].append(path)
-    return selected
+            lines.extend(['', f'### {title}', '', *table])
+    return lines
+
+
+def write_episodes(
+    cases: list[tuple],
+    rows: list[list[EpisodeResult | None]],
+    videos: list[list[Path | None]],
+    path: Path,
+    output: Path,
+) -> None:
+    """Show each episode's videos from every run side by side."""
+    lines = [
+        '# Episode videos',
+        '',
+        (
+            'The same episode (seed and start/goal steps) from every run. '
+            'Episodes that failed somewhere come first.'
+        ),
+        '',
+        f'[Back to evaluation results]({relative_url(output, path)})',
+    ]
+    order = sorted(
+        range(len(cases)),
+        key=lambda i: list(OUTCOME_GROUPS).index(outcome_group(rows[i])),
+    )
+    for index in order:
+        results = rows[index]
+        known = [r for r in results if r and r.success is not None]
+        lines.extend(
+            [
+                '',
+                f'<a id="episode-{index}"></a>',
+                '',
+                f'## {cell(case_label(cases[index]))}',
+                '',
+                (
+                    f'{OUTCOME_GROUPS[outcome_group(results)]}; '
+                    f'{sum(r.success for r in known)}/{len(known)} runs '
+                    'succeed.'
+                ),
+                '',
+                '<table>',
+            ]
+        )
+        entries = [
+            (run, result, video)
+            for run, (result, video) in enumerate(
+                zip(results, videos[index]), 1
+            )
+            if result is not None
+        ]
+        for start in range(0, len(entries), 4):
+            lines.append('<tr>')
+            for run, result, video in entries[start : start + 4]:
+                errors = '<br>'.join(
+                    f'{ERROR_METRICS[key]}: {value:.4g}'
+                    for key, value in result.errors.items()
+                )
+                player = (
+                    '<video controls width="320" preload="none">'
+                    f'<source src="{relative_url(video, path)}" '
+                    'type="video/mp4"></video><br>'
+                    if video
+                    else '<i>No video</i><br>'
+                )
+                lines.append(
+                    f'<td>{player}<b>Run {run}</b> {outcome_mark(result)}'
+                    f'<br>{errors}</td>'
+                )
+            lines.append('</tr>')
+        lines.append('</table>')
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
 def short_path(value: str) -> str:
@@ -233,14 +477,18 @@ def portable_text(value: str) -> str:
     return ABSOLUTE_PATH.sub(shorten, value)
 
 
-def cell(value: Any) -> str:
+def plain(value: Any) -> str:
     text = str(value)
     if isinstance(value, (str, Path)) and (
         text.startswith(('/', '~/')) or re.match(r'[A-Za-z]:[/\\]', text)
     ):
         text = short_path(text)
+    return portable_text(text)
+
+
+def cell(value: Any) -> str:
     return (
-        portable_text(text)
+        plain(value)
         .replace('&', '&amp;')
         .replace('<', '&lt;')
         .replace('>', '&gt;')
@@ -945,70 +1193,27 @@ def write_report(
 
     lines.extend(error_plots(evaluations, output))
 
-    for index, evaluation in enumerate(evaluations, 1):
-        lines.extend(
-            [
-                '',
-                f'## Run {index}',
-                '',
-            ]
-        )
-        if evaluation.record_count > 1:
-            lines.extend(
-                [
-                    (
-                        f'Using record {evaluation.record_count} of '
-                        f'{evaluation.record_count}. Videos reflect the files '
-                        'currently in the evaluation directory.'
-                    ),
-                    '',
-                ]
+    cases, rows = episode_results(evaluations)
+    episodes_path = output.with_name(f'{output.stem}_episodes.md')
+    videos = [
+        [
+            copy_asset(
+                result.video,
+                output.parent
+                / f'{output.stem}_videos'
+                / f'run_{run:03d}'
+                / result.video.name,
+                copy_videos,
             )
-        videos = select_videos(evaluation)
-        for success, label in ((False, 'Failure'), (True, 'Success')):
-            lines.extend([f'### {label} videos', ''])
-            for video_index, source in enumerate(videos[success], 1):
-                target = source
-                if copy_videos:
-                    target = (
-                        output.parent
-                        / f'{output.stem}_videos'
-                        / f'run_{index:03d}'
-                        / source.name
-                    )
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    if source.resolve() != target.resolve():
-                        shutil.copy2(source, target)
-                lines.extend(
-                    [
-                        f'**{label} {video_index}**',
-                        '',
-                        '<video controls width="640" preload="none">',
-                        (
-                            f'  <source src="{relative_url(target, output)}" '
-                            'type="video/mp4">'
-                        ),
-                        '  Your viewer does not support embedded video.',
-                        '</video>',
-                        '',
-                    ]
-                )
-            if len(videos[success]) < 2:
-                lines.append(
-                    f'Only {len(videos[success])} of 2 requested '
-                    f'{label.lower()} videos available. Unclassified videos '
-                    'are omitted.'
-                )
-            lines.append('')
-        lines.extend(
-            [
-                '### Metrics',
-                '',
-                '```text',
-                portable_text(evaluation.results_text),
-                '```',
-            ]
-        )
+            if result and result.video
+            else None
+            for run, result in enumerate(results, 1)
+        ]
+        for results in rows
+    ]
+    lines.extend(episode_lines(cases, rows, output, episodes_path))
+    if cases:
+        write_episodes(cases, rows, videos, episodes_path, output)
     expert_files = sorted(
         {
             *experiment_files(expert_dirs or [], 'expert_candidates.json'),
@@ -1021,6 +1226,8 @@ def write_report(
             ),
         }
     )
+    diagnostic_lines: list[str] = []
+    diagnostic_shared: list[str] = []
     for title, files, landscape in (
         (
             'Action-space energy landscapes',
@@ -1034,6 +1241,8 @@ def write_report(
         )
         lines.extend(section)
         shared_lines.extend(common)
+        diagnostic_lines.extend(section)
+        diagnostic_shared.extend(common)
     shared_path.write_text('\n'.join(shared_lines) + '\n', encoding='utf-8')
     if warnings:
         lines.extend(['', '## Skipped result files', ''])
@@ -1041,6 +1250,117 @@ def write_report(
             f'- {cell(portable_text(warning))}' for warning in warnings
         )
     output.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    runs = []
+    for index, (evaluation, config) in enumerate(zip(evaluations, configs), 1):
+        directory = evaluation.source.parent
+        match = EPOCH.match(directory.name)
+        runs.append(
+            {
+                'id': index,
+                'name': plain(directory.relative_to(root).as_posix()),
+                'group': match[1] if match else directory.name,
+                'epoch': int(match[2]) if match else None,
+                'records': evaluation.record_count,
+                'success_rate': evaluation.success_rate,
+                'means': {
+                    key: value
+                    for key, value in evaluation.mean_errors.items()
+                    if math.isfinite(value)
+                },
+                'params': {
+                    key: plain(config.get(key, '—')) for key in differing
+                },
+            }
+        )
+    html_path = output.with_suffix('.html')
+    data = {
+        'prefix': prefix,
+        'metrics': ERROR_METRICS,
+        'runs': runs,
+        'differing': differing,
+        'shared': {key: plain(value) for key, value in shared.items()},
+        'episodes': [
+            {
+                'label': case_label(case),
+                'case': dict(
+                    zip(('seed', 'expert', 'start', 'goal', 'index'), case)
+                ),
+                'group': outcome_group(results),
+                'results': [
+                    result
+                    and {
+                        'success': result.success,
+                        'errors': result.errors,
+                        'video': video and relative_url(video, html_path),
+                    }
+                    for result, video in zip(results, episode_videos)
+                ],
+            }
+            for case, results, episode_videos in zip(cases, rows, videos)
+        ],
+        'diagnostics': markdown_html(diagnostic_lines, output, html_path),
+        'diagnostic_shared': markdown_html(
+            diagnostic_shared, output, html_path
+        ),
+        'warnings': [portable_text(warning) for warning in warnings],
+    }
+    template = Path(__file__).with_name('eval_report.html')
+    html_path.write_text(
+        template.read_text(encoding='utf-8').replace(
+            '__REPORT_DATA__',
+            json.dumps(data, allow_nan=False).replace('</', '<\\/'),
+        ),
+        encoding='utf-8',
+    )
+
+
+def markdown_html(lines: list[str], source: Path, target: Path) -> str:
+    """Convert the report's own Markdown subset (headings, tables, images)."""
+    html: list[str] = []
+    table: list[list[str]] = []
+
+    def link(url: str) -> str:
+        if '://' in url:
+            return url
+        return relative_url(source.parent / unquote(url), target)
+
+    def flush() -> None:
+        if table:
+            header, _, *body = table
+            html.append(
+                '<div class="table-wrap"><table><thead><tr>'
+                + ''.join(f'<th>{value}</th>' for value in header)
+                + '</tr></thead><tbody>'
+                + ''.join(
+                    '<tr>' + ''.join(f'<td>{v}</td>' for v in row) + '</tr>'
+                    for row in body
+                )
+                + '</tbody></table></div>'
+            )
+            table.clear()
+
+    for line in lines:
+        if line.startswith('|'):
+            table.append(
+                [v.strip() for v in line.strip().strip('|').split('|')]
+            )
+            continue
+        flush()
+        if match := re.fullmatch(r'(#{2,3}) (.*)', line):
+            level = len(match[1])
+            html.append(f'<h{level}>{match[2]}</h{level}>')
+        elif match := re.fullmatch(r'!\[(.*)\]\((.*)\)', line):
+            html.append(f'<img alt="{match[1]}" src="{link(match[2])}">')
+        elif match := re.search(r'src="([^"]+)"', line):
+            html.append(line.replace(match[1], link(match[1])))
+        elif line.startswith('**') and line.endswith('**'):
+            html.append(f'<p><b>{line[2:-2]}</b></p>')
+        elif line.startswith('<'):
+            html.append(line)
+        elif line:
+            html.append(f'<p>{line}</p>')
+    flush()
+    return '\n'.join(html)
 
 
 def main() -> None:
@@ -1056,7 +1376,7 @@ def main() -> None:
         '--output',
         type=Path,
         default=Path('results.md'),
-        help='Markdown output (default: results.md)',
+        help='Report path; .md and .html are both written (default: results.md)',
     )
     parser.add_argument(
         '--result-pattern',
@@ -1104,7 +1424,7 @@ def main() -> None:
         raise SystemExit('No valid results in matching evaluation directories')
     write_report(
         evaluations,
-        args.output.expanduser().resolve(),
+        args.output.expanduser().resolve().with_suffix('.md'),
         root,
         args.prefix,
         copy_videos=not args.link_videos,
@@ -1112,7 +1432,10 @@ def main() -> None:
         landscape_dirs=args.landscape_dir,
         expert_dirs=args.expert_dir,
     )
-    print(f'Wrote {len(evaluations)} evaluations to {args.output}')
+    output = args.output.with_suffix('')
+    print(
+        f'Wrote {len(evaluations)} evaluations to {output}.md and {output}.html'
+    )
 
 
 if __name__ == '__main__':
