@@ -295,6 +295,13 @@ def run(cfg):
                 cfg.data.dataset.num_steps, window
             )
 
+    # Proprio models: load their columns; they are normalized like actions.
+    proprio_columns = list(cfg.model.get('proprio_columns') or [])
+    with open_dict(cfg):
+        for col in proprio_columns:
+            if col not in cfg.data.dataset.keys_to_load:
+                cfg.data.dataset.keys_to_load.append(col)
+
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop('name')
     dataset_dir = os.environ.get('LOCAL_DATASET_DIR', None)
@@ -325,6 +332,10 @@ def run(cfg):
         cfg.model.action_encoder.input_dim = (
             cfg.data.dataset.frameskip * dataset.get_dim('action')
         )
+        if proprio_columns:
+            cfg.model.proprio_encoder.input_dim = sum(
+                dataset.get_dim(col) for col in proprio_columns
+            )
 
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform

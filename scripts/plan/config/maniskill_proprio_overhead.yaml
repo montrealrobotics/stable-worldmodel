@@ -1,0 +1,11 @@
+# Overhead image goals plus the goal frame's proprio columns, for LeWMProprio.
+# keys_to_cache must list the model's proprio_columns: each is z-scored with
+# dataset statistics, matching training, and also applied to its goal_ copy.
+defaults:
+  - maniskill_overhead
+  - _self_
+subdir: overhead_proprio_${now:%Y%m%d_%H%M%S}
+world:
+  state_goal: true
+dataset:
+  keys_to_cache: [action, obs_agent_qpos, obs_extra_tcp_pose]
