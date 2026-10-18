@@ -6,13 +6,15 @@ Example (run from the repository root)::
     python scripts/visualization/gather_eval_results.py /path/to/checkpoints \
         --prefix cube_ --output results.md
 
+Omit --prefix to gather every result file under the root.
+
 Searches recursively, uses the latest record in each *_results.txt file and
 writes two reports beside each other: results.html, an interactive report
 (run selector, error charts, episode × run outcome matrix and a synced
 episode video viewer; loads plotly.js from a CDN), and results.md with static
 plots. Episodes are matched across runs by seeds and start/goal steps, and
 results_episodes.md shows each episode's videos from every run side by side.
-Episode videos are copied beside the reports. Shared settings go into a
+Episode videos are copied beside the reports (omit them with --no-videos). Shared settings go into a
 linked *_shared_parameters.md file; the reports compare differing model,
 planning, and evaluation parameters.
 Add --landscape-dir and --expert-dir to include saved diagnostic experiments.
@@ -25,6 +27,7 @@ no model, GPU, or video decoder is needed.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import math
 import os
@@ -59,6 +62,12 @@ ABSOLUTE_PATH = re.compile(
 )
 # Run directories named <model>_ep<N> become one line per model over epochs.
 EPOCH = re.compile(r'^(.*)_ep(\d+)$')
+# Checkpoint paths such as <model>/weights_epoch_<N>.pt yield model and epoch.
+CHECKPOINT = re.compile(r'([^/\\]+)[/\\][^/\\]*?(epoch|step)_(\d+)\.\w+$')
+FACET_NAMES = {
+    'plan_config.horizon': 'horizon',
+    'eval.goal_offset_steps': 'goal steps',
+}
 ERROR_METRICS = {
     'xy_error_m': 'T XY error (m)',
     'eef_position_error_m': 'EEF position error (m)',
@@ -190,8 +199,16 @@ def parse_result(path: Path) -> Evaluation:
     )
 
 
-def discover(root: Path, prefix: str, result_pattern: str) -> list[Path]:
-    """Match literal directory-name prefixes, including the root itself."""
+def discover(
+    root: Path,
+    prefix: str,
+    result_pattern: str,
+    exclude: list[str] | None = None,
+) -> list[Path]:
+    """Match literal directory-name prefixes, including the root itself.
+
+    `exclude` globs are matched against directory paths relative to the root.
+    """
     directories = [root] if root.name.startswith(prefix) else []
     directories.extend(
         path
@@ -204,8 +221,38 @@ def discover(root: Path, prefix: str, result_pattern: str) -> list[Path]:
             for directory in directories
             for path in directory.glob(result_pattern)
             if path.is_file()
+            and not any(
+                fnmatch.fnmatch(directory.relative_to(root).as_posix(), glob)
+                for glob in exclude or []
+            )
         }
     )
+
+
+def run_facets(params: dict[str, str]) -> dict[str, str]:
+    """Name differing settings for report filters; split checkpoint paths."""
+    facets = {}
+    for key, value in params.items():
+        if match := CHECKPOINT.search(value):
+            facets['model'] = match[1]
+            facets[match[2]] = match[3]
+        else:
+            facets[FACET_NAMES.get(key, key.rsplit('.', 1)[-1])] = value
+    return facets
+
+
+def run_group(directory: Path, root: Path) -> tuple[str, int | None]:
+    """Group <model>_ep<N> runs by their path with the epoch removed.
+
+    Nested directories such as <model>_ep<N>/expert_candidates form their own
+    group instead of merging with every other run's expert_candidates.
+    """
+    parts = list(directory.relative_to(root).parts) or [directory.name]
+    for index in reversed(range(len(parts))):
+        if match := EPOCH.match(parts[index]):
+            parts[index] = match[1]
+            return '/'.join(parts), int(match[2])
+    return '/'.join(parts), None
 
 
 def episode_cases(evaluation: Evaluation) -> list[tuple]:
@@ -592,6 +639,7 @@ def experiment_section(
     warnings: list[str],
     landscape: bool = False,
     root: Path | None = None,
+    include_videos: bool = True,
 ) -> tuple[list[str], list[str]]:
     """Summarize saved diagnostic JSON and link or copy visualization assets."""
     rows = []
@@ -693,7 +741,7 @@ def experiment_section(
         ]
         if landscape:
             video = diagnostics.get('comparison_video')
-            if isinstance(video, str):
+            if include_videos and isinstance(video, str):
                 source = (path.parent / video).resolve()
                 if (
                     source.is_relative_to(path.parent.resolve())
@@ -766,7 +814,7 @@ def experiment_section(
                     )
                     continue
                 target = source
-                if copy_assets:
+                if include_videos and copy_assets:
                     target = (
                         output.parent
                         / f'{output.stem}_videos'
@@ -781,16 +829,16 @@ def experiment_section(
                     f'Expert / selected / goal — environment '
                     f'{comparison.get("env_index", "—")}'
                 )
-                lines.extend(
-                    [
-                        f'**{cell(label)}**',
-                        '',
-                        '<video controls width="960" preload="none">',
-                        f'  <source src="{relative_url(target, output)}" type="video/mp4">',
-                        '</video>',
-                        '',
-                    ]
-                )
+                lines.extend([f'**{cell(label)}**', ''])
+                if include_videos:
+                    lines.extend(
+                        [
+                            '<video controls width="960" preload="none">',
+                            f'  <source src="{relative_url(target, output)}" type="video/mp4">',
+                            '</video>',
+                            '',
+                        ]
+                    )
                 outcomes = comparison.get('outcomes', {})
                 if isinstance(outcomes, dict):
                     lines.extend(
@@ -895,7 +943,9 @@ def experiment_section(
     return lines, common
 
 
-def error_plots(evaluations: list[Evaluation], output: Path) -> list[str]:
+def error_plots(
+    evaluations: list[Evaluation], output: Path, root: Path
+) -> list[str]:
     """Compare final episode errors on matching seeds and saved run means."""
     metrics = [
         key
@@ -1004,7 +1054,7 @@ def error_plots(evaluations: list[Evaluation], output: Path) -> list[str]:
         episodes_ax.set_xlabel('Eval seed / expert seed (if different)')
         episodes_ax.set_title('Per-episode final error')
         if cases:
-            episodes_ax.legend(fontsize=8)
+            outside_legend(fig, len(evaluations))
         else:
             episodes_ax.text(
                 0.5,
@@ -1015,8 +1065,11 @@ def error_plots(evaluations: list[Evaluation], output: Path) -> list[str]:
             )
         means_ax.set_xticks(
             range(len(evaluations)),
-            [f'Run {index}' for index in range(1, len(evaluations) + 1)],
+            [str(index) for index in range(1, len(evaluations) + 1)],
+            fontsize=8,
         )
+        means_ax.set_xlim(-0.75, len(evaluations) - 0.25)
+        means_ax.set_xlabel('Run (numbers match the results table)')
         means_ax.set_title('Mean final error across episodes')
         for ax in (episodes_ax, means_ax):
             ax.set_ylabel(ERROR_METRICS[key])
@@ -1030,8 +1083,21 @@ def error_plots(evaluations: list[Evaluation], output: Path) -> list[str]:
         lines.extend(
             [f'![{ERROR_METRICS[key]}]({relative_url(target, output)})', '']
         )
-    lines.extend(mean_error_lines(evaluations, metrics, figure_dir, output))
+    lines.extend(
+        mean_error_lines(evaluations, metrics, figure_dir, output, root)
+    )
     return lines
+
+
+def outside_legend(fig, entries: int, *handles_labels) -> None:
+    """Legend right of the axes, in enough columns to fit the figure height."""
+    rows = max(1, int(fig.get_figheight() / 0.18))
+    fig.legend(
+        *handles_labels,
+        loc='outside right upper',
+        ncol=max(1, math.ceil(entries / rows)),
+        fontsize=8,
+    )
 
 
 def mean_error_lines(
@@ -1039,44 +1105,62 @@ def mean_error_lines(
     metrics: list[str],
     figure_dir: Path,
     output: Path,
+    root: Path,
 ) -> list[str]:
-    """Plot mean errors as lines, one per run name with its _epN removed."""
+    """Plot success rate and mean errors as lines, one per run name with
+    its _epN removed."""
     import matplotlib.pyplot as plt
 
     groups: dict[str, list[tuple[int, Evaluation]]] = {}
+    epochs = True
     for index, evaluation in enumerate(evaluations, 1):
-        name = evaluation.source.parent.name
-        match = EPOCH.match(name)
-        group, x = (match[1], int(match[2])) if match else (name, index)
-        groups.setdefault(group, []).append((x, evaluation))
-    epochs = all(EPOCH.match(e.source.parent.name) for e in evaluations)
+        group, epoch = run_group(evaluation.source.parent, root)
+        epochs = epochs and epoch is not None
+        groups.setdefault(group, []).append((epoch or index, evaluation))
+    panels = [
+        ('success_rate', 'Success rate (%)'),
+        *((key, ERROR_METRICS[key]) for key in metrics),
+    ]
     fig, axes = plt.subplots(
-        len(metrics),
+        len(panels),
         1,
-        figsize=(9, 3.5 * len(metrics)),
+        figsize=(9, 3.5 * len(panels)),
         squeeze=False,
         constrained_layout=True,
     )
-    for ax, key in zip(axes[:, 0], metrics):
+    for ax, (key, label) in zip(axes[:, 0], panels):
         for group, points in groups.items():
             points = sorted(
-                (x, e.mean_errors.get(key, math.nan)) for x, e in points
+                (
+                    x,
+                    e.success_rate
+                    if key == 'success_rate'
+                    else e.mean_errors.get(key, math.nan),
+                )
+                for x, e in points
             )
             points = [(x, y) for x, y in points if math.isfinite(y)]
             if points:
                 ax.plot(*zip(*points), marker='o', label=group)
-        ax.set_ylabel(ERROR_METRICS[key])
+        ax.set_ylabel(label)
         ax.set_xlabel('Epoch' if epochs else 'Run')
         ax.set_ylim(bottom=0)
         ax.grid(alpha=0.25)
-        ax.legend(fontsize=8)
-    axes[0, 0].set_title('Mean final error across episodes')
+    axes[0, 0].set_title('Success rate')
+    axes[1, 0].set_title('Mean final error across episodes')
+    if groups:
+        # Every run has a success rate, so the top panel lists all groups.
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        outside_legend(fig, len(handles), handles, labels)
     target = figure_dir / 'mean_errors.png'
     try:
         fig.savefig(target, dpi=150)
     finally:
         plt.close(fig)
-    return [f'![Mean errors]({relative_url(target, output)})', '']
+    return [
+        f'![Success rate and mean errors]({relative_url(target, output)})',
+        '',
+    ]
 
 
 def write_report(
@@ -1088,6 +1172,7 @@ def write_report(
     warnings: list[str] | None = None,
     landscape_dirs: list[Path] | None = None,
     expert_dirs: list[Path] | None = None,
+    include_videos: bool = True,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     warnings = list(warnings or [])
@@ -1153,7 +1238,11 @@ def write_report(
     lines = [
         '# Evaluation results',
         '',
-        f'Evaluation directory names start with `{prefix}`.',
+        (
+            f'Evaluation directory names start with `{prefix}`.'
+            if prefix
+            else 'All evaluation directories under the root.'
+        ),
         '',
         (
             'Success rates are percentages. Each run shows its latest '
@@ -1191,7 +1280,7 @@ def write_report(
         ]
         lines.append('| ' + ' | '.join(values) + ' |')
 
-    lines.extend(error_plots(evaluations, output))
+    lines.extend(error_plots(evaluations, output, root))
 
     cases, rows = episode_results(evaluations)
     episodes_path = output.with_name(f'{output.stem}_episodes.md')
@@ -1205,7 +1294,7 @@ def write_report(
                 / result.video.name,
                 copy_videos,
             )
-            if result and result.video
+            if include_videos and result and result.video
             else None
             for run, result in enumerate(results, 1)
         ]
@@ -1237,7 +1326,14 @@ def write_report(
         ('Expert-action selection', expert_files, False),
     ):
         section, common = experiment_section(
-            title, files, output, copy_videos, warnings, landscape, root
+            title,
+            files,
+            output,
+            copy_videos,
+            warnings,
+            landscape,
+            root,
+            include_videos,
         )
         lines.extend(section)
         shared_lines.extend(common)
@@ -1253,13 +1349,13 @@ def write_report(
     runs = []
     for index, (evaluation, config) in enumerate(zip(evaluations, configs), 1):
         directory = evaluation.source.parent
-        match = EPOCH.match(directory.name)
+        group, epoch = run_group(directory, root)
         runs.append(
             {
                 'id': index,
                 'name': plain(directory.relative_to(root).as_posix()),
-                'group': match[1] if match else directory.name,
-                'epoch': int(match[2]) if match else None,
+                'group': group,
+                'epoch': epoch,
                 'records': evaluation.record_count,
                 'success_rate': evaluation.success_rate,
                 'means': {
@@ -1272,6 +1368,13 @@ def write_report(
                 },
             }
         )
+    for run in runs:
+        run['facets'] = run_facets(run['params'])
+    # Keep only facets that distinguish runs.
+    for name in {name for run in runs for name in run['facets']}:
+        if len({run['facets'].get(name) for run in runs}) < 2:
+            for run in runs:
+                run['facets'].pop(name, None)
     html_path = output.with_suffix('.html')
     data = {
         'prefix': prefix,
@@ -1369,7 +1472,9 @@ def main() -> None:
         'root', type=Path, help='Directory searched recursively'
     )
     parser.add_argument(
-        '--prefix', required=True, help='Literal evaluation directory prefix'
+        '--prefix',
+        default='',
+        help='Literal evaluation directory prefix (default: all directories)',
     )
     parser.add_argument(
         '-o',
@@ -1384,9 +1489,24 @@ def main() -> None:
         help='Result filename glob within each matched directory',
     )
     parser.add_argument(
+        '--exclude',
+        action='append',
+        default=[],
+        help=(
+            'Skip directories whose path under the root matches this glob, '
+            "e.g. '*/expert_candidates' (repeatable)"
+        ),
+    )
+    parser.add_argument(
         '--link-videos',
         action='store_true',
         help='Link original videos and figures instead of copying them',
+    )
+    parser.add_argument(
+        '--no-videos',
+        dest='include_videos',
+        action='store_false',
+        help='Omit episode and diagnostic videos; keep tables and plots',
     )
     parser.add_argument(
         '--landscape-dir',
@@ -1409,11 +1529,9 @@ def main() -> None:
             parser.error(f'experiment directory does not exist: {directory}')
     if not root.is_dir():
         parser.error(f'root is not a directory: {root}')
-    if not args.prefix:
-        parser.error('--prefix must not be empty')
     evaluations: list[Evaluation] = []
     warnings: list[str] = []
-    for path in discover(root, args.prefix, args.result_pattern):
+    for path in discover(root, args.prefix, args.result_pattern, args.exclude):
         try:
             evaluations.append(parse_result(path))
         except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
@@ -1431,6 +1549,7 @@ def main() -> None:
         warnings=warnings,
         landscape_dirs=args.landscape_dir,
         expert_dirs=args.expert_dir,
+        include_videos=args.include_videos,
     )
     output = args.output.with_suffix('')
     print(

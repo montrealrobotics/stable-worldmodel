@@ -88,6 +88,12 @@ aside input[type=search] { width: 100%; }
 .run:hover { color: var(--text); }
 .run .rate { margin-left: auto; font-variant-numeric: tabular-nums;
   color: var(--muted); font-size: 12px; }
+.facet { margin-bottom: 10px; }
+.facet-name { display: flex; align-items: center; gap: 6px; font-weight: 600;
+  margin-bottom: 4px; }
+.facet-name button { margin-left: auto; padding: 0 6px; font-size: 12px; }
+.facet .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.facet .chip { padding: 1px 8px; font-size: 12px; overflow-wrap: anywhere; }
 .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
 main { padding: 16px 20px 60px; min-width: 0; }
 .panel {
@@ -165,9 +171,11 @@ details > summary { cursor: pointer; font-weight: 600; }
     <h2>Runs</h2>
     <div class="row"><input type="search" id="filter" placeholder="Filter runs (regex)"></div>
     <div class="row">
-      <button id="all">All</button><button id="none">None</button>
+      <button id="all">All</button><button id="none">None</button><select id="top" title="Select the best runs by success rate among those matching the filter">
+        <option value="">Top %</option></select>
       <span id="count" class="meta" style="align-self:center;color:var(--muted)"></span>
     </div>
+    <div id="facets"></div>
     <div id="runs"></div>
   </aside>
   <main>
@@ -254,9 +262,18 @@ const metrics = Object.entries(DATA.metrics)
     DATA.episodes.some((e) => e.results.some((x) => x && key in x.errors)));
 const groups = [...new Set(runs.map((r) => r.group))];
 const byEpoch = runs.every((r) => r.epoch != null);
+// Color every shown group, ranked by best success rate: the palette for the
+// top 8, then evenly spread hues (golden angle) for the rest.
+let colorSlots = new Map();
+function rankColors() {
+  const best = new Map();
+  for (const r of visibleRuns()) best.set(r.group, Math.max(best.get(r.group) ?? -Infinity, r.success_rate));
+  colorSlots = new Map([...best].sort((a, b) => b[1] - a[1]).map(([group], slot) => [group, slot]));
+}
 const colorOf = (run) => {
-  const slot = groups.indexOf(run.group);
-  return slot < 8 ? css(`--s${slot + 1}`) : css('--muted');
+  const slot = colorSlots.get(run.group);
+  if (slot == null) return css('--muted');
+  return slot < 8 ? css(`--s${slot + 1}`) : `hsl(${(slot * 137.508) % 360} 65% 52%)`;
 };
 const runLabel = (r) => r.epoch != null ? `ep${r.epoch}` : `Run ${r.id}`;
 const shortCase = (e) => {
@@ -272,14 +289,25 @@ let selected = new Set(store.get(selectionKey) ?? runs.map((r) => r.id));
 selected = new Set([...selected].filter((id) => runs.some((r) => r.id === id)));
 if (!selected.size) selected = new Set(runs.map((r) => r.id));
 let filterText = '';
+const facetNames = [...new Set(runs.flatMap((r) => Object.keys(r.facets || {})))];
+const facetOf = (r, f) => r.facets?.[f] ?? '—';
+const facetValues = Object.fromEntries(facetNames.map((f) => {
+  const values = [...new Set(runs.map((r) => facetOf(r, f)))];
+  const numeric = values.every((v) => v !== '' && !isNaN(v));
+  return [f, values.sort(numeric ? (a, b) => a - b : undefined)];
+}));
+let facetOn = Object.fromEntries(facetNames.map((f) => [f, new Set(facetValues[f])]));
+const facetMatch = (r) => facetNames.every((f) => facetOn[f].has(facetOf(r, f)));
 let focus = {episode: null, run: null};
 // Display order: by model group, then epoch (run names sort ep100 before ep15).
 const ordered = [...runs].sort((a, b) =>
   groups.indexOf(a.group) - groups.indexOf(b.group) || (a.epoch ?? a.id) - (b.epoch ?? b.id));
-const visibleRuns = () => ordered.filter((r) => selected.has(r.id));
+// Parameter filters, the name filter and run checkboxes control everything shown.
+const visibleRuns = () => ordered.filter((r) => selected.has(r.id) && matchesFilter(r));
 
 // ---------- sidebar ----------
 function matchesFilter(run) {
+  if (!facetMatch(run)) return false;
   if (!filterText) return true;
   try { return new RegExp(filterText, 'i').test(run.name); }
   catch { return run.name.toLowerCase().includes(filterText.toLowerCase()); }
@@ -300,8 +328,27 @@ function renderSidebar() {
     </div>`;
   }).join('');
   $('runs').innerHTML = html || '<p class="empty">No runs match.</p>';
-  $('count').textContent = `${selected.size}/${runs.length} selected`;
+  $('count').textContent = `${visibleRuns().length}/${runs.length} shown`;
 }
+function renderFacets() {
+  $('facets').innerHTML = facetNames.map((f) => `<div class="facet">
+    <div class="facet-name">${esc(f)}<button data-facet-all="${esc(f)}">all</button></div>
+    <div class="chips">${facetValues[f].map((v) => `<span class="chip ${facetOn[f].has(v) ? 'on' : ''}"
+      data-facet="${esc(f)}" data-value="${esc(v)}" title="Click to toggle; shift-click to show only this">${esc(v)}</span>`).join('')}</div>
+  </div>`).join('');
+}
+$('facets').addEventListener('click', (event) => {
+  const target = event.target.closest('[data-facet], [data-facet-all]');
+  if (!target) return;
+  const all = target.dataset.facetAll;
+  if (all != null) facetOn[all] = new Set(facetValues[all]);
+  else {
+    const {facet, value} = target.dataset;
+    if (event.shiftKey) facetOn[facet] = new Set([value]);
+    else facetOn[facet].has(value) ? facetOn[facet].delete(value) : facetOn[facet].add(value);
+  }
+  update();
+});
 $('runs').addEventListener('change', (event) => {
   const box = event.target;
   if (box.dataset.run) {
@@ -312,9 +359,19 @@ $('runs').addEventListener('change', (event) => {
   }
   update();
 });
-$('filter').addEventListener('input', (event) => { filterText = event.target.value; renderSidebar(); });
+$('filter').addEventListener('input', (event) => { filterText = event.target.value; update(); });
 $('all').onclick = () => { runs.filter(matchesFilter).forEach((r) => selected.add(r.id)); update(); };
 $('none').onclick = () => { runs.filter(matchesFilter).forEach((r) => selected.delete(r.id)); update(); };
+$('top').innerHTML += [5, 10, 15, 20, 25, 30, 40, 50, 75]
+  .map((p) => `<option value="${p}">Top ${p}%</option>`).join('');
+$('top').onchange = (event) => {
+  const candidates = runs.filter(matchesFilter);
+  const count = Math.max(1, Math.ceil(candidates.length * event.target.value / 100));
+  const best = candidates.sort((a, b) => b.success_rate - a.success_rate).slice(0, count);
+  selected = new Set(best.map((r) => r.id));
+  event.target.value = '';  // Reset so the same percentage can be reapplied.
+  update();
+};
 
 // ---------- plotly helpers ----------
 function baseLayout(extra = {}) {
@@ -342,8 +399,12 @@ function legendHtml(list) {
 // ---------- overview ----------
 function renderOverview() {
   const vis = visibleRuns();
-  const shown = groups.filter((g) => vis.some((r) => r.group === g));
-  $('overview-legend').innerHTML = shown.length > 1 ? legendHtml(shown) : '';
+  // Best-ranked groups draw last, on top.
+  const shown = groups.filter((g) => vis.some((r) => r.group === g))
+    .sort((a, b) => colorSlots.get(b) - colorSlots.get(a));
+  const legend = [...colorSlots.keys()].slice(0, 12);
+  $('overview-legend').innerHTML = shown.length > 1
+    ? legendHtml(legend) + (shown.length > legend.length ? `<span>+${shown.length - legend.length} more</span>` : '') : '';
   const panels = [['success_rate', 'Success rate (%)'], ...metrics.map(([k, label]) => [k, `Mean ${label}`])];
   $('overview').innerHTML = panels.map(([key]) => `<div class="chart" id="ov-${key}"></div>`).join('');
   for (const [key, label] of panels) {
@@ -623,7 +684,7 @@ function renderStatic() {
   $('warnings').innerHTML = DATA.warnings.length
     ? `<h2>Skipped result files</h2><ul>${DATA.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : '';
   $('warnings').style.display = DATA.warnings.length ? '' : 'none';
-  $('meta').textContent = `${runs.length} runs · ${DATA.episodes.length} episodes · prefix “${DATA.prefix}”`;
+  $('meta').textContent = `${runs.length} runs · ${DATA.episodes.length} episodes ${DATA.prefix ? ` · prefix “${DATA.prefix}”` : ''}`;
   $('color-by').innerHTML = `<option value="outcome">Outcome</option>` +
     metrics.map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('');
   $('scatter-metric').innerHTML = metrics.map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('');
@@ -649,11 +710,14 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => upda
 
 function update() {
   store.set(selectionKey, [...selected]);
+  rankColors();
+  renderFacets();
   renderSidebar();
   renderOverview();
   renderTable();
   renderEpisodes();
 }
+rankColors();
 applyTheme();
 renderStatic();
 update();

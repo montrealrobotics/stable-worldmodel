@@ -12,6 +12,7 @@ from scripts.visualization.gather_eval_results import (
     discover,
     episode_results,
     parse_result,
+    run_facets,
     write_report,
 )
 
@@ -44,6 +45,30 @@ def test_discovery_uses_literal_prefix_and_includes_root(tmp_path):
     result(tmp_path / 'other_cube_[three]')
     assert discover(tmp_path, 'cube_[', '*_results.txt') == [first, second]
     assert discover(first.parent, 'cube_[', '*_results.txt') == [first]
+    every = discover(tmp_path, '', '*_results.txt')
+    assert len(every) == 3 and first in every and second in every
+    assert discover(
+        tmp_path, '', '*_results.txt', ['*/evals/*', 'other*']
+    ) == [first]
+
+
+def test_run_groups_strip_epochs_and_keep_nested_dirs_apart(tmp_path):
+    from scripts.visualization.gather_eval_results import run_group
+
+    assert run_group(tmp_path / 'a' / 'model_ep10', tmp_path) == (
+        'a/model',
+        10,
+    )
+    assert run_group(tmp_path / 'model_ep5' / 'expert', tmp_path) == (
+        'model/expert',
+        5,
+    )
+    assert run_group(tmp_path / 'other_ep5' / 'expert', tmp_path) == (
+        'other/expert',
+        5,
+    )
+    assert run_group(tmp_path / 'baseline', tmp_path) == ('baseline', None)
+    assert run_group(tmp_path, tmp_path) == (tmp_path.name, None)
 
 
 def test_latest_record_and_complete_numpy_arrays(tmp_path):
@@ -360,6 +385,42 @@ def test_report_embeds_videos_and_keeps_config(tmp_path, copy_videos):
     assert len(copied) == (4 if copy_videos else 0)
     assert all(path.read_bytes() == b'video' for path in copied)
     assert output.with_suffix('.html').is_file()
+
+
+def test_run_facets_split_checkpoint_and_name_settings():
+    assert run_facets(
+        {
+            'policy': 'lewm_res_bn_1/weights_epoch_10.pt',
+            'plan_config.horizon': '3',
+            'eval.goal_offset_steps': '15',
+            'solver.num_samples': '128',
+        }
+    ) == {
+        'model': 'lewm_res_bn_1',
+        'epoch': '10',
+        'horizon': '3',
+        'goal steps': '15',
+        'num_samples': '128',
+    }
+    assert run_facets({'policy': 'pusht/lewm'}) == {'policy': 'pusht/lewm'}
+
+
+def test_report_without_videos_keeps_tables(tmp_path):
+    root = tmp_path / 'inputs'
+    evaluation = parse_result(result(root / 'cube_one'))
+    for index in range(4):
+        (evaluation.source.parent / f'episode_{index}.mp4').write_bytes(b'x')
+    output = tmp_path / 'report' / 'results.md'
+    write_report([evaluation], output, root, 'cube_', include_videos=False)
+    assert '| Run 1 — cube_one |' in output.read_text()
+    episodes = output.with_name('results_episodes.md').read_text()
+    assert '<video' not in episodes
+    html = output.with_suffix('.html').read_text()
+    data = json.loads(re.search(r'const DATA = (.*);\n', html)[1])
+    assert all(
+        r['video'] is None for e in data['episodes'] for r in e['results']
+    )
+    assert not list(output.parent.rglob('*.mp4'))
 
 
 def test_report_compares_differing_important_settings(tmp_path):
