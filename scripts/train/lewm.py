@@ -1,3 +1,4 @@
+import math
 import os
 from functools import partial
 from pathlib import Path
@@ -189,12 +190,35 @@ def normalize_pixels(batch):
     return batch
 
 
+def sigreg_weight(sigreg, progress):
+    """SIGReg weight at a training progress in [0, 1].
+
+    With a schedule, the weight holds until `schedule_start` and then decays
+    to `final_weight` at the end of training. Keep `final_weight` above zero:
+    SIGReg is the only term preventing representation collapse.
+    """
+    schedule = sigreg.get('schedule')
+    if not schedule:
+        return sigreg.weight
+    start = sigreg.get('schedule_start', 0.0)
+    t = min(max((progress - start) / max(1 - start, 1e-8), 0.0), 1.0)
+    if schedule == 'cosine':
+        t = (1 - math.cos(math.pi * t)) / 2
+    elif schedule != 'linear':
+        raise ValueError(f'unknown SIGReg schedule: {schedule}')
+    return sigreg.weight + (sigreg.final_weight - sigreg.weight) * t
+
+
 def lejepa_forward(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.sigreg.weight
+    progress = 0.0
+    if cfg.loss.sigreg.get('schedule'):
+        total = max(1, self.trainer.estimated_stepping_batches)
+        progress = self.global_step / total
+    lambd = sigreg_weight(cfg.loss.sigreg, progress)
 
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
@@ -229,6 +253,7 @@ def lejepa_forward(self, batch, stage, cfg):
     losses_dict = {
         f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k
     }
+    losses_dict[f'{stage}/sigreg_weight'] = float(lambd)
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
 
     interval = cfg.get('gradient_diagnostics_interval', 100)

@@ -94,6 +94,12 @@ model:
 loss:
   sigreg:
     weight: 0.09
+    # Decay the weight to final_weight by the end of training: null (constant),
+    # linear or cosine. It holds at `weight` until schedule_start (fraction of
+    # training). Keep final_weight > 0; SIGReg is the only anti-collapse term.
+    schedule: null
+    schedule_start: 0.0
+    final_weight: 0.009
     # TC-LeWM: center latents over windows of this many frames before SIGReg
     # (null = standard SIGReg; the paper centers over the full 4-frame clip).
     # num_steps is raised to at least this; SIGReg sees all loaded frames.
