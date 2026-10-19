@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from mani_skill.utils.structs.pose import Pose
 
-from stable_worldmodel.envs.maniskill.pusht import PushTSWMEnv
+from stable_worldmodel.envs.maniskill.pusht import PushTSWMEnv, PushTTask
 
 
 class FakeScene(gym.Env):
@@ -98,7 +98,7 @@ class AdapterTests(unittest.TestCase):
 
         scene = DatasetScene()
         with patch(
-            'stable_worldmodel.envs.maniskill.pusht.gym.make',
+            'stable_worldmodel.envs.maniskill.wrapper.gym.make',
             return_value=scene,
         ):
             env = PushTSWMEnv(
@@ -121,7 +121,7 @@ class AdapterTests(unittest.TestCase):
             version_base=None,
         ):
             cfg = compose(config_name='maniskill_state_overhead')
-        with patch.object(env, '_expert_goal') as expert_goal:
+        with patch.object(env.goal_sampler, 'sample') as expert_goal:
             env.reset(seed=42)
             _apply_callables(
                 env,
@@ -160,7 +160,7 @@ class AdapterTests(unittest.TestCase):
 
         scene = EEFScene()
         with patch(
-            'stable_worldmodel.envs.maniskill.pusht.gym.make',
+            'stable_worldmodel.envs.maniskill.wrapper.gym.make',
             return_value=scene,
         ):
             env = PushTSWMEnv(
@@ -168,9 +168,7 @@ class AdapterTests(unittest.TestCase):
                 goal_step_distance=5,
                 goal_eef_position_tolerance=0.02,
             )
-        env._expert = SimpleNamespace(
-            get_action=lambda *args, **kwargs: torch.zeros(1, 2)
-        )
+        env._expert = SimpleNamespace(act=lambda obs: np.zeros((1, 2), dtype=np.float32))
         _, info = env.reset(seed=42)
         # Expert terminates after one step, before the requested offset.
         torch.testing.assert_close(
@@ -231,7 +229,7 @@ class AdapterTests(unittest.TestCase):
         scene = FakeScene()
         with (
             patch(
-                'stable_worldmodel.envs.maniskill.pusht.gym.make',
+                'stable_worldmodel.envs.maniskill.wrapper.gym.make',
                 return_value=scene,
             ) as make,
             patch(
@@ -239,7 +237,7 @@ class AdapterTests(unittest.TestCase):
                 return_value=expert,
             ),
             patch(
-                'stable_worldmodel.envs.maniskill.pusht.torch.load',
+                'stable_worldmodel.envs.maniskill.expert.torch.load',
                 return_value={},
             ),
         ):
@@ -294,15 +292,13 @@ class AdapterTests(unittest.TestCase):
             with self.subTest(requested=requested):
                 scene = ExpertScene()
                 with patch(
-                    'stable_worldmodel.envs.maniskill.pusht.gym.make',
+                    'stable_worldmodel.envs.maniskill.wrapper.gym.make',
                     return_value=scene,
                 ):
                     env = PushTSWMEnv(
                         image_size=8, goal_step_distance=requested
                     )
-                env._expert = SimpleNamespace(
-                    get_action=lambda *args, **kwargs: torch.zeros(1, 2)
-                )
+                env._expert = SimpleNamespace(act=lambda obs: np.zeros((1, 2), dtype=np.float32))
                 env.state_goal = True
                 obs, info = env.reset(
                     seed=0, options={'start_from_beginning': beginning}
@@ -346,20 +342,18 @@ class AdapterTests(unittest.TestCase):
 
         scene = BrokenReset()
         with patch(
-            'stable_worldmodel.envs.maniskill.pusht.gym.make',
+            'stable_worldmodel.envs.maniskill.wrapper.gym.make',
             return_value=scene,
         ):
             env = PushTSWMEnv(image_size=8)
-        env._expert = SimpleNamespace(
-            get_action=lambda *a, **kw: torch.zeros(1, 2)
-        )
+        env._expert = SimpleNamespace(act=lambda obs: np.zeros((1, 2), dtype=np.float32))
         with self.assertRaisesRegex(RuntimeError, 'Expert replay failed'):
             env.reset(seed=42)
 
     def test_goal_render_restores_scene_and_gym_shapes(self):
         scene = FakeScene()
         with patch(
-            'stable_worldmodel.envs.maniskill.pusht.gym.make',
+            'stable_worldmodel.envs.maniskill.wrapper.gym.make',
             return_value=scene,
         ):
             env = PushTSWMEnv(image_size=8)
@@ -430,8 +424,10 @@ def test_current_state_expert_query_does_not_advance_live_scene():
     env._evaluation_options = {}
     env._executed_actions = [np.zeros(2), np.zeros(2)]
     env._expert = SimpleNamespace(
-        get_action=lambda obs, **kwargs: torch.full(
-            (1, 2), float(obs['rgb'][0, 0, 0, 0]) / 10
+        act=lambda obs: np.full(
+            (1, 2),
+            float(obs['sensor_data']['base_camera']['rgb'][0, 0, 0, 0]) / 10,
+            dtype=np.float32,
         )
     )
     for action in env._executed_actions:
@@ -517,12 +513,10 @@ class RetryScene(FakeScene):
 
 def retry_env(scene, **kwargs):
     with patch(
-        'stable_worldmodel.envs.maniskill.pusht.gym.make', return_value=scene
+        'stable_worldmodel.envs.maniskill.wrapper.gym.make', return_value=scene
     ):
         env = PushTSWMEnv(image_size=8, goal_step_distance=1, **kwargs)
-    env._expert = SimpleNamespace(
-        get_action=lambda *args, **kwargs: torch.zeros(1, 2)
-    )
+    env._expert = SimpleNamespace(act=lambda obs: np.zeros((1, 2), dtype=np.float32))
     env.state_goal = True
     return env
 
@@ -597,7 +591,7 @@ def test_retry_seed_generation_skips_previously_attempted_seeds():
     rng = SimpleNamespace(integers=lambda *args: next(draws))
     draws = iter([10, 1000, 1000, 2000])
     with patch(
-        'stable_worldmodel.envs.maniskill.pusht.np.random.default_rng',
+        'stable_worldmodel.envs.maniskill.goals.np.random.default_rng',
         return_value=rng,
     ):
         _, info = env.reset(seed=10)
@@ -668,7 +662,7 @@ def test_expert_retries_stop_at_attempt_limit(
 def test_expert_retry_settings_are_validated_before_simulator_creation(
     settings,
 ):
-    with patch('stable_worldmodel.envs.maniskill.pusht.gym.make') as make:
+    with patch('stable_worldmodel.envs.maniskill.wrapper.gym.make') as make:
         with pytest.raises(ValueError):
             PushTSWMEnv(**settings)
         make.assert_not_called()
@@ -695,9 +689,7 @@ def test_comparison_replays_both_sequences_without_advancing_live_scene(
     env._executed_actions = [np.zeros(2), np.zeros(2)]
     env._goal = np.full((8, 8, 3), 77, dtype=np.uint8)
     env._goal_pose = live.tee.pose.raw_pose.clone()
-    env.goal_position_tolerance = 0.02
-    env.goal_yaw_tolerance = 0.15
-    env.goal_eef_position_tolerance = None
+    env.task = PushTTask()
     env._goal_eef_position = None
     captured = []
 
@@ -738,7 +730,7 @@ def test_comparison_replays_both_sequences_without_advancing_live_scene(
 def test_goal_distances_use_xy_xyz_and_wrapped_yaw(yaw, goal_yaw, expected):
     scene = FakeScene()
     with patch(
-        'stable_worldmodel.envs.maniskill.pusht.gym.make', return_value=scene
+        'stable_worldmodel.envs.maniskill.wrapper.gym.make', return_value=scene
     ):
         env = PushTSWMEnv(image_size=8)
     scene.tee.pose = Pose.create_from_pq(

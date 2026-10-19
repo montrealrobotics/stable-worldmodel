@@ -1,5 +1,14 @@
 """Observation schema shared with ManiSkill PPO dataset collection."""
 
+import numpy as np
+
+
+def single(value):
+    """Copy the first item of a ManiSkill batch to a NumPy value on CPU."""
+    if hasattr(value, 'detach'):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)[0].copy()
+
 
 def state_dict(obs):
     # Preserve ManiSkill's state-only observation ordering, including privileged

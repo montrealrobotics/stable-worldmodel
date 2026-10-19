@@ -22,6 +22,8 @@ world:
   goal_position_tolerance: 0.02
   goal_yaw_tolerance: 0.15
   expert_output_dir: null
+  # Reuse expert goal rollouts across runs (same seed, goal distance, expert, GPU).
+  expert_cache_dir: null
 
 dataset:
   stats: ${eval.dataset_name}
