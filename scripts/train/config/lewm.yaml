@@ -107,3 +107,9 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  # Diagnostic only: a linear head predicts the object's yaw (sin, cos) from
+  # the embedding, supervised with privileged simulator pose (wxyz quaternion
+  # at indices 3:7 of `column`). Tests whether missing yaw limits planning.
+  aux_yaw:
+    weight: 0.0
+    column: obs_extra_obj_pose

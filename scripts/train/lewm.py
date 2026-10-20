@@ -245,6 +245,13 @@ def lejepa_forward(self, batch, stage, cfg):
         reg_emb = temporal_center(reg_emb, window)
     output['sigreg_loss'] = self.sigreg(reg_emb.transpose(0, 1))
     output['loss'] = output['pred_loss'] + lambd * output['sigreg_loss']
+    aux_yaw = cfg.loss.get('aux_yaw') or {}
+    if aux_yaw.get('weight', 0) > 0:
+        w, x, y, z = batch[aux_yaw.column][..., 3:7].float().unbind(-1)
+        yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        target = torch.stack([yaw.sin(), yaw.cos()], -1)  # (B, T, 2)
+        output['aux_yaw_loss'] = F.mse_loss(self.aux_head(emb), target)
+        output['loss'] = output['loss'] + aux_yaw.weight * output['aux_yaw_loss']
     search = getattr(cfg.loss, 'search', None)
     if search and search.weight > 0:
         output['search_loss'] = search_loss(self.model, batch, emb, cfg)
@@ -302,6 +309,13 @@ def run(cfg):
             if col not in cfg.data.dataset.keys_to_load:
                 cfg.data.dataset.keys_to_load.append(col)
 
+    # Yaw auxiliary: load the raw object pose; it must stay unnormalized.
+    aux_yaw = cfg.loss.get('aux_yaw') or {}
+    aux_col = aux_yaw.get('column') if aux_yaw.get('weight', 0) > 0 else None
+    if aux_col and aux_col not in cfg.data.dataset.keys_to_load:
+        with open_dict(cfg):
+            cfg.data.dataset.keys_to_load.append(aux_col)
+
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop('name')
     dataset_dir = os.environ.get('LOCAL_DATASET_DIR', None)
@@ -323,7 +337,7 @@ def run(cfg):
 
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
-            if col.startswith('pixels'):
+            if col.startswith('pixels') or col == aux_col:
                 continue
 
             normalizer = get_column_normalizer(dataset, col, col)
@@ -384,9 +398,12 @@ def run(cfg):
     total_steps = (
         max_epochs * len(train) if max_epochs > 0 else cfg.trainer.max_steps
     )
+    extra_modules = {}
+    if aux_col:
+        extra_modules['aux_head'] = torch.nn.Linear(cfg.embed_dim, 2)
     optimizers = {
         'model_opt': {
-            'modules': 'model',
+            'modules': 'model|aux_head' if aux_col else 'model',
             'optimizer': dict(cfg.optimizer),
             'scheduler': {
                 'type': 'LinearWarmupCosineAnnealingLR',
@@ -403,6 +420,7 @@ def run(cfg):
     world_model = spt.Module(
         model=world_model,
         sigreg=SIGReg(**cfg.loss.sigreg.kwargs),
+        **extra_modules,
         forward=partial(lejepa_forward, cfg=cfg),
         optim=optimizers,
     )
