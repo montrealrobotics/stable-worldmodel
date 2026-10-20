@@ -140,3 +140,47 @@ def filter_successful_episodes(
         'Successful episode clips: kept %d/%d', len(indices), len(dataset)
     )
     return Subset(dataset, indices)
+
+
+def filter_replay_episodes(
+    dataset: Dataset,
+    *,
+    max_replays: int | None = None,
+    keep_expert: bool = True,
+    num_groups: int | None = None,
+    max_clips: int | None = None,
+    seed: int = 0,
+) -> Subset:
+    """Select expert episodes and their noisy replays by group.
+
+    Uses the episode-scoped ``group_idx`` and ``replay_idx`` columns written
+    by noisy-replay collection (``replay_idx`` is -1 for the expert run).
+    Keeps replays with ``replay_idx < max_replays`` (0 keeps experts only),
+    drops experts when ``keep_expert`` is false, then a seeded random sample
+    of ``num_groups`` groups and finally ``max_clips`` random clips, so
+    subsets with different noisy ratios can share one training budget.
+    """
+    info = dataset.get_episode_data()
+    group = np.asarray(info['group_idx'])
+    replay = np.asarray(info['replay_idx'])
+    rng = np.random.default_rng(seed)
+    keep = np.ones(len(group), dtype=bool)
+    if max_replays is not None:
+        keep &= replay < max_replays
+    if not keep_expert:
+        keep &= replay >= 0
+    if num_groups is not None:
+        groups = np.unique(group[keep])
+        if num_groups > len(groups):
+            raise ValueError(f'num_groups={num_groups} > {len(groups)} available groups')
+        keep &= np.isin(group, rng.choice(groups, num_groups, replace=False))
+    episodes = set(np.flatnonzero(keep).tolist())
+    indices = [i for i, (ep, _) in enumerate(dataset.clip_indices) if ep in episodes]
+    if max_clips is not None:
+        if max_clips > len(indices):
+            raise ValueError(f'max_clips={max_clips} > {len(indices)} selected clips')
+        indices = sorted(rng.choice(indices, max_clips, replace=False).tolist())
+    logger.info(
+        'Replay filter: kept %d episodes, %d/%d clips', len(episodes), len(indices), len(dataset)
+    )
+    return Subset(dataset, indices)

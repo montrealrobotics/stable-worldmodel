@@ -167,3 +167,34 @@ def test_no_short_episodes():
 def test_invalid_length_limit(limit):
     with pytest.raises(ValueError, match='positive integer'):
         successful_episode_indices(demonstrations(), max_episode_length=limit)
+
+
+class Replays(Dataset):
+    """Two groups: expert (replay -1) plus replays 0 and 1, 20 steps each."""
+
+    def __init__(self):
+        super().__init__(np.full(6, 20), np.arange(0, 120, 20), frameskip=5, num_steps=2)
+
+    def get_episode_data(self, episodes_idx=None):
+        return {'group_idx': [0, 0, 0, 1, 1, 1], 'replay_idx': [-1, 0, 1, -1, 0, 1]}
+
+    def _load_slice(self, ep_idx, start, end):
+        return {'episode': ep_idx}
+
+
+def episodes(subset):
+    return sorted({subset[i]['episode'] for i in range(len(subset))})
+
+
+def test_replay_filter_selects_by_replay_index_and_group():
+    from stable_worldmodel.data.filtering import filter_replay_episodes
+
+    data = Replays()
+    assert episodes(filter_replay_episodes(data, max_replays=0)) == [0, 3]
+    assert episodes(filter_replay_episodes(data, max_replays=1)) == [0, 1, 3, 4]
+    assert episodes(filter_replay_episodes(data, keep_expert=False)) == [1, 2, 4, 5]
+    one_group = episodes(filter_replay_episodes(data, num_groups=1, seed=3))
+    assert one_group in ([0, 1, 2], [3, 4, 5])
+    assert len(filter_replay_episodes(data, max_clips=7)) == 7
+    with pytest.raises(ValueError):
+        filter_replay_episodes(data, num_groups=3)

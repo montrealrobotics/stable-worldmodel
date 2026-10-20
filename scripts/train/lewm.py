@@ -16,6 +16,7 @@ from stable_pretraining import data as dt
 
 import stable_worldmodel as swm
 from stable_worldmodel.data import column_normalizer as get_column_normalizer
+from stable_worldmodel.data.filtering import filter_replay_episodes
 from stable_worldmodel.planning.objective import GoalMSE
 from stable_worldmodel.wm.diagnostics import encoder_gradient_diagnostics
 from stable_worldmodel.wm.lewm.detached_rollout import detached_rollout
@@ -353,6 +354,11 @@ def run(cfg):
 
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
+
+    # Noisy-replay ratio sweeps: subset after fitting normalizers on all data.
+    replay_filter = cfg.get('replay_filter')
+    if replay_filter:
+        dataset = filter_replay_episodes(dataset, **replay_filter)
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(

@@ -113,3 +113,8 @@ loss:
   aux_yaw:
     weight: 0.0
     column: obs_extra_obj_pose
+
+# Noisy-replay datasets only: null trains on everything. Set a dict of
+# filter_replay_episodes args (max_replays, keep_expert, num_groups,
+# max_clips, seed) to vary the noisy/expert ratio at a fixed budget.
+replay_filter: null
