@@ -20,7 +20,14 @@ training transforms. Per model it reports:
   cosine between predicted and true latent changes;
 - ridge probes from the embedding to T xy, T yaw (sin, cos) and EEF xy;
 - the share of embedding variance explained by a quadratic regression on
-  T state, EEF state and both.
+  T state, EEF state and both;
+- where yaw is lost: probes and per-factor (yaw, T xy, EEF) variance shares
+  on the ViT CLS token before its final LayerNorm (``cls_preln_*``), after
+  it (``cls_*``) and on the embedding (``emb_*``);
+- the projector's hidden layer before its norm, after it and after the
+  activation (``hid_pre``/``hid_normed``/``hid_act``): spread of per-unit
+  stds, yaw share weighted by unit variance vs per unit, count of
+  yaw-correlated units and their std relative to the median unit.
 
 Probes and regressions fit on the first half of the samples and report
 variance-weighted R² on the second half. Runs on CPU or GPU.
@@ -83,25 +90,97 @@ def poly2(f):
     return np.concatenate([f] + [f[:, i:i + 1] * f[:, j:j + 1] for i in range(n) for j in range(i, n)], 1)
 
 
-def ridge_r2(x, y, lam):
-    """Fit on the first half, variance-weighted R² on the second half."""
+def ridge_r2(x, y, lam, per_unit=False):
+    """Fit on the first half, R² on the second half.
+
+    Variance-weighted by default (high-variance outputs count more); with
+    ``per_unit`` every output dimension counts equally.
+    """
     h = len(x) // 2
     x = np.concatenate([x, np.ones((len(x), 1))], 1)
     w = np.linalg.solve(x[:h].T @ x[:h] + lam * np.eye(x.shape[1]), x[:h].T @ y[:h])
-    res = y[h:] - x[h:] @ w
-    return float(1 - (res**2).sum() / ((y[h:] - y[h:].mean(0)) ** 2).sum())
+    res = ((y[h:] - x[h:] @ w) ** 2).sum(0)
+    tot = ((y[h:] - y[h:].mean(0)) ** 2).sum(0)
+    if per_unit:
+        keep = tot > 1e-12
+        return float(np.mean(1 - res[keep] / tot[keep]))
+    return float(1 - res.sum() / tot.sum())
+
+
+def factor_share(z, t_feat, e_feat, prefix):
+    """Share of ``z``'s variance explained by each state factor on its own."""
+    factors = {'yaw': t_feat[:, 2:], 'Txy': t_feat[:, :2], 'eef': e_feat}
+    return {f'{prefix}_var_expl_by_{k}': ridge_r2(poly2(f), z, lam=1e-2) for k, f in factors.items()}
+
+
+def hidden_stats(h, yaw_feat, prefix, corr_threshold=0.3):
+    """Per-unit scale of a hidden layer and how much of it tracks yaw.
+
+    Reports the spread of per-unit standard deviations, the yaw share of the
+    layer weighted by unit variance and with every unit equal, the number of
+    units whose |corr| with sin or cos yaw exceeds ``corr_threshold``, and
+    the median std of those yaw units relative to all units.
+    """
+    std = h.std(0)
+    hz = (h - h.mean(0)) / (std + 1e-8)
+    yz = (yaw_feat - yaw_feat.mean(0)) / (yaw_feat.std(0) + 1e-8)
+    corr = np.abs(hz.T @ yz / len(h)).max(1)
+    yaw_units = corr > corr_threshold
+    q10, q50, q90 = np.quantile(std, [0.1, 0.5, 0.9])
+    return {
+        f'{prefix}_std_p10': float(q10),
+        f'{prefix}_std_p50': float(q50),
+        f'{prefix}_std_p90': float(q90),
+        f'{prefix}_std_p90_p10': float(q90 / (q10 + 1e-12)),
+        f'{prefix}_yaw_share_varweighted': ridge_r2(poly2(yaw_feat), h, lam=1e-2),
+        f'{prefix}_yaw_share_perunit': ridge_r2(poly2(yaw_feat), h, lam=1e-2, per_unit=True),
+        f'{prefix}_yaw_units': int(yaw_units.sum()),
+        f'{prefix}_yaw_unit_rel_std': float(np.median(std[yaw_units]) / q50) if yaw_units.any() else float('nan'),
+    }
+
+
+@torch.no_grad()
+def encoder_layers(model, pixels):
+    """CLS token and the projector's hidden layer for one frame per sample.
+
+    Mirrors ``LeWM.encode``: ``cls`` is the ViT output (after its final
+    LayerNorm), ``pre`` the projector's first Linear, ``normed`` after its
+    norm (identity without one, fixed affine for BN in eval mode) and
+    ``act`` after the activation. Hidden layers are None when the projector
+    is not an MLP.
+    """
+    dtype = next(model.encoder.parameters()).dtype
+    out = {}
+    final_ln = getattr(model.encoder, 'layernorm', None)  # HF ViT's final LayerNorm
+    hook = final_ln.register_forward_hook(
+        lambda mod, inp, _: out.__setitem__('cls_preln', inp[0][:, 0])
+    ) if final_ln is not None else None
+    try:
+        out['cls'] = model.encoder(pixels.to(dtype), interpolate_pos_encoding=True).last_hidden_state[:, 0]
+    finally:
+        if hook is not None:
+            hook.remove()
+    net = getattr(model.projector, 'net', None)
+    if net is None:
+        return out
+    out['pre'] = net[0](out['cls'])
+    out['normed'] = net[1](out['pre'])
+    out['act'] = net[2](out['normed'])
+    return out
 
 
 @torch.no_grad()
 def diagnose(model, batch, t_feat, e_feat, device):
     pixels = batch['pixels'].to(device)
     action = batch['action'].to(device)
-    emb, preds = [], []
+    emb, preds, layers = [], [], []
     for sl in torch.split(torch.arange(len(pixels)), 256):
         info = model.encode({'pixels': pixels[sl], 'action': action[sl]})
         emb.append(info['emb'])
         preds.append(model.predict({'emb': info['emb'][:, :1], 'act_emb': info['act_emb'][:, :1]})['preds'][:, 0])
+        layers.append(encoder_layers(model, pixels[sl, 0]))
     emb, pred = torch.cat(emb), torch.cat(preds)
+    layers = {k: torch.cat([lay[k] for lay in layers]).float().cpu().numpy() for k in layers[0]}
     torch.manual_seed(0)
     sigreg = SIGReg().to(device)(emb[:, :1].transpose(0, 1)).item()
 
@@ -109,6 +188,20 @@ def diagnose(model, batch, t_feat, e_feat, device):
     ev = np.linalg.eigvalsh(np.cov(e0.T))[::-1]
     true_d, pred_d = e1 - e0, p - e0
     true_n, pred_n = np.linalg.norm(true_d, axis=1), np.linalg.norm(pred_d, axis=1)
+    where = {}
+    for name in ('cls_preln', 'cls'):
+        if name in layers:
+            z = layers[name]
+            where.update({
+                f'{name}_probe_yaw': ridge_r2(z, t_feat[:, 2:], lam=1.0),
+                f'{name}_probe_Txy': ridge_r2(z, t_feat[:, :2], lam=1.0),
+                f'{name}_probe_eef': ridge_r2(z, e_feat, lam=1.0),
+                **factor_share(z, t_feat, e_feat, name),
+            })
+    where.update(factor_share(e0, t_feat, e_feat, 'emb'))
+    for name in ('pre', 'normed', 'act'):
+        if name in layers:
+            where.update(hidden_stats(layers[name], t_feat[:, 2:], f'hid_{name}'))
     return {
         'mean_dim_var': float(ev.mean()),
         'mean_abs_center': float(np.abs(e0.mean(0)).mean()),
@@ -126,6 +219,7 @@ def diagnose(model, batch, t_feat, e_feat, device):
         'var_expl_by_T': ridge_r2(poly2(t_feat), e0, lam=1e-2),
         'var_expl_by_eef': ridge_r2(poly2(e_feat), e0, lam=1e-2),
         'var_expl_by_both': ridge_r2(poly2(np.concatenate([t_feat, e_feat], 1)), e0, lam=1e-2),
+        **where,
     }
 
 
