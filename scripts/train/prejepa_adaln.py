@@ -22,11 +22,11 @@ from torch.utils.data import DataLoader
 # ---------------------------------------------------------------------------
 
 
-def get_img_preprocessor(source, target, img_size=224):
-    stats = spt.data.dataset_stats.ImageNet
-    return spt.data.transforms.Compose(
-        spt.data.transforms.ToImage(**stats, source=source, target=target),
-        spt.data.transforms.Resize(img_size, source=source, target=target),
+def get_img_preprocessor(source, target):
+    """Ship uint8 frames at native size; the model normalizes and resizes on
+    the GPU (4x less host-to-GPU copy, no CPU resize to 224)."""
+    return spt.data.transforms.ToImage(
+        dtype=torch.uint8, source=source, target=target
     )
 
 
@@ -36,35 +36,55 @@ def get_img_preprocessor(source, target, img_size=224):
 
 
 class SaveCkptCallback(Callback):
-    """Callback to save model checkpoints by training step."""
+    """Save weights with save_pretrained every ``epoch_interval`` epochs and
+    every ``step_interval`` steps (either may be null), plus at the end."""
 
-    def __init__(self, run_name, cfg, step_interval=None):
+    def __init__(self, run_name, cfg, epoch_interval=None, step_interval=None):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
+        self.epoch_interval = epoch_interval
         self.step_interval = step_interval
-        self.last_saved_step = 0
+        self._saved = None
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = trainer.global_step
+        if (
+            trainer.is_global_zero
+            and self.step_interval
+            and step % self.step_interval == 0
+            and self._saved != ('step', step)
+        ):
+            self._save(pl_module.model, 'step', step)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch + 1
+        if (
+            trainer.is_global_zero
+            and self.epoch_interval
+            and epoch % self.epoch_interval == 0
+        ):
+            self._save(pl_module.model, 'epoch', epoch)
+
+    def on_train_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
             return
+        # current_epoch counts finished epochs here (plus one if stopped
+        # mid-epoch), matching the 1-based epoch names above.
+        if trainer.max_epochs and trainer.max_epochs > 0:
+            final = ('epoch', max(trainer.current_epoch, 1))
+        else:
+            final = ('step', trainer.global_step)
+        if self._saved != final:
+            self._save(pl_module.model, *final)
 
-        step = trainer.global_step
-        if step <= self.last_saved_step:
-            return
-
-        is_interval = self.step_interval and step % self.step_interval == 0
-        is_final = trainer.max_steps > 0 and step >= trainer.max_steps
-        if is_interval or is_final:
-            self._save(pl_module.model, step)
-            self.last_saved_step = step
-
-    def _save(self, model, step):
+    def _save(self, model, unit, n):
+        self._saved = (unit, n)
         save_pretrained(
             model,
             run_name=self.run_name,
             config=self.cfg,
-            filename=f'weights_step_{step}.pt',
+            filename=f'weights_{unit}_{n}.pt',
         )
 
 
@@ -76,7 +96,7 @@ class SaveCkptCallback(Callback):
 def dinowm_forward(self, batch, stage, cfg):
     """Encode observations, predict next states, compute losses."""
     for key in self.model.extra_encoders:
-        batch[key] = torch.nan_to_num(batch[key], 0.0).squeeze()
+        batch[key] = torch.nan_to_num(batch[key], 0.0)
 
     batch = self.model.encode(batch, target='emb')
 
@@ -134,14 +154,11 @@ def dinowm_forward(self, batch, stage, cfg):
     return batch
 
 
-def get_max_training_steps(cfg) -> int:
-    max_steps = cfg.trainer.get('max_steps', None)
-    if max_steps is None or max_steps <= 0:
-        raise ValueError(
-            'Set trainer.max_steps to a positive integer. '
-            'PreJEPA AdaLN training is controlled by iterations instead of epochs.'
-        )
-    return int(max_steps)
+def check_training_length(cfg):
+    max_epochs = cfg.trainer.get('max_epochs', None) or -1
+    max_steps = cfg.trainer.get('max_steps', None) or -1
+    if max_epochs <= 0 and max_steps <= 0:
+        raise ValueError('Set trainer.max_epochs or trainer.max_steps.')
 
 
 # ---------------------------------------------------------------------------
@@ -169,11 +186,7 @@ def run(cfg):
     )
 
 
-    transforms = [
-        get_img_preprocessor(
-            source='pixels', target='pixels', img_size=cfg.image_size
-        ),
-    ]
+    transforms = [get_img_preprocessor(source='pixels', target='pixels')]
 
     with open_dict(cfg) as cfg:
         for col in cfg.data.dataset.keys_to_load:
@@ -208,15 +221,16 @@ def run(cfg):
         **cfg.loader,
         generator=rnd_gen,
     )
+    val_workers = cfg.get('val_num_workers', 2)
     val_loader = DataLoader(
         val_set,
         batch_size=cfg.loader.batch_size,
-        num_workers=2,
+        num_workers=val_workers,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        persistent_workers=val_workers > 0,
+        prefetch_factor=2 if val_workers > 0 else None,
     )
-    get_max_training_steps(cfg)
+    check_training_length(cfg)
 
     # --- Model ---
     encoder = hydra.utils.instantiate(cfg.model.encoder)
@@ -259,6 +273,7 @@ def run(cfg):
         cfg.model.predictor.dim = embed_dim
         cfg.model.predictor.condition_dim = predictor_condition_dim
         cfg.model.predictor.num_patches = num_patches
+        cfg.model.img_size = cfg.image_size
         extra_encoder_modules = {}
         for key in cfg.wm.get('encoding', {}):
             if key == 'action':
@@ -284,13 +299,31 @@ def run(cfg):
         }
 
     world_model = hydra.utils.instantiate(cfg.model, encoder=encoder)
+    if cfg.get('compile', False):
+        # The frozen encoder dominates the step; the predictor is cheap.
+        world_model.backbone.compile()
+        world_model.predictor.compile()
 
+    optim = {'modules': 'model', 'optimizer': dict(cfg.optimizer)}
+    warmup_ratio = cfg.get('warmup_ratio', None)
+    if warmup_ratio is not None:
+        # Same schedule as LeWM: linear warmup, then cosine decay to 0
+        # (spt steps the scheduler after every optimizer step).
+        max_epochs = cfg.trainer.get('max_epochs', None) or -1
+        total_steps = (
+            max_epochs * len(train_loader)
+            if max_epochs > 0
+            else cfg.trainer.max_steps
+        )
+        optim['scheduler'] = {
+            'type': 'LinearWarmupCosineAnnealingLR',
+            'warmup_steps': max(1, int(warmup_ratio * total_steps)),
+            'max_steps': total_steps,
+        }
     world_model = spt.Module(
         model=world_model,
         forward=partial(dinowm_forward, cfg=cfg),
-        optim={
-            'model_opt': {'modules': 'model', 'optimizer': dict(cfg.optimizer)}
-        },
+        optim={'model_opt': optim},
     )
 
     # --- Training ---
@@ -309,12 +342,13 @@ def run(cfg):
         logger = WandbLogger(**cfg.wandb.config)
         logger.log_hyperparams(OmegaConf.to_container(cfg))
 
+    # Full Lightning state for resuming only; keep just the latest.
     checkpoint_callback = ModelCheckpoint(
         dirpath=run_dir,
         filename='step_{step}',
         every_n_train_steps=cfg.get('save_step_interval', None),
         save_last=True,
-        save_top_k=-1,
+        save_top_k=1,
     )
 
     trainer = pl.Trainer(
@@ -323,7 +357,8 @@ def run(cfg):
             SaveCkptCallback(
                 run_name=run_id or cfg.output_model_name,
                 cfg=cfg.model,
-                step_interval=cfg.get('save_step_interval', None),
+                epoch_interval=cfg.get('save_epoch_interval', None),
+                step_interval=cfg.get('save_weights_step_interval', None),
             ),
             checkpoint_callback,
             pl.pytorch.callbacks.LearningRateMonitor(logging_interval='step'),

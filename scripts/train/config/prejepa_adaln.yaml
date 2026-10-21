@@ -12,7 +12,13 @@ seed: 42
 image_size: 224
 patch_size: 14  # must match the encoder's patch size (14 for dinov2/dino/mae)
 dump_object: true
+compile: false
+val_num_workers: 2
+# Full Lightning checkpoint (resume) every N steps; keeps the latest only.
 save_step_interval: 5000
+# Export weights_epoch_N.pt / weights_step_N.pt (null disables either).
+save_epoch_interval: 1
+save_weights_step_interval: null
 
 
 loader:
@@ -81,13 +87,16 @@ optimizer:
   type: AdamW
   lr: 5e-4
   weight_decay: 0.0
+# null: constant lr (DINO-WM default). A fraction (e.g. 0.01) adds LeWM's
+# linear warmup over that share of training, then cosine decay to 0.
+warmup_ratio: null
 
 # --- Trainer ---
 trainer:
   default_root_dir: ${oc.env:STABLEWM_HOME}/checkpoints/${subdir}/pl_trainer
+  max_epochs: -1
   max_steps: 100000
-  strategy: ddp
   devices: auto
   accelerator: gpu
-  precision: 16-mixed
+  precision: bf16-mixed
   gradient_clip_val: 1.0

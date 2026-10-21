@@ -2,6 +2,9 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
 
 class AdaLNPreJEPA(torch.nn.Module):
     def __init__(
@@ -15,8 +18,12 @@ class AdaLNPreJEPA(torch.nn.Module):
         interpolate_pos_encoding=True,
         extra_fusion='feature',
         image_representation='patches',
+        img_size=None,
     ):
         super().__init__()
+        # Encoder input size: smaller frames (e.g. 128 px data) are resized on
+        # the GPU, so loaders and the planner can stay at native resolution.
+        self.img_size = img_size
 
         self.backbone = encoder
         self.predictor = predictor
@@ -50,7 +57,7 @@ class AdaLNPreJEPA(torch.nn.Module):
 
         with torch.no_grad():
             pixels_embed = self._encode_image(
-                info[pixels_key].float()
+                info[pixels_key]
             )  # (B, T, 3, H, W)
 
         # == improve the embedding
@@ -93,6 +100,20 @@ class AdaLNPreJEPA(torch.nn.Module):
         # == pixels embedding
         B = pixels.shape[0]
         pixels = rearrange(pixels, 'b t ... -> (b t) ...')
+        if pixels.dtype == torch.uint8:
+            # Training loaders ship uint8 frames; normalize like ToImage.
+            mean = pixels.new_tensor(IMAGENET_MEAN, dtype=torch.float32)
+            std = pixels.new_tensor(IMAGENET_STD, dtype=torch.float32)
+            pixels = (pixels / 255.0 - mean.view(3, 1, 1)) / std.view(3, 1, 1)
+        pixels = pixels.float()
+        if self.img_size and pixels.shape[-1] != self.img_size:
+            pixels = F.interpolate(
+                pixels,
+                size=(self.img_size, self.img_size),
+                mode='bilinear',
+                antialias=True,
+                align_corners=False,
+            )
 
         kwargs = (
             {'interpolate_pos_encoding': True}
@@ -129,7 +150,11 @@ class AdaLNPreJEPA(torch.nn.Module):
                     :, : 1 + num_register_tokens, :
                 ]
             else:
-                pixels_embed = pixels_embed[:, -256:, :]  # drop CLS/registers
+                # Drop CLS and registers (DINOv3: CLS, 4 registers, patches).
+                num_register_tokens = getattr(
+                    self.backbone.config, 'num_register_tokens', 0
+                )
+                pixels_embed = pixels_embed[:, 1 + num_register_tokens :, :]
         else:
             pixels_embed = pixels_embed.logits.unsqueeze(
                 1
@@ -239,6 +264,8 @@ class AdaLNPreJEPA(torch.nn.Module):
         # check if we have already computed the initial embedding for this state
         if (
             hasattr(self, '_init_cached_info')
+            and 'id' in info
+            and 'step_idx' in info
             and torch.equal(self._init_cached_info['id'], info['id'][:, 0])
             and torch.equal(
                 self._init_cached_info['step_idx'], info['step_idx'][:, 0]
@@ -366,6 +393,7 @@ class AdaLNPreJEPA(torch.nn.Module):
         z = rearrange(z_flat, '(b n) ... -> b n ...', b=B, n=N)
         # == update info dict with predicted embeddings
         info['predicted_embedding'] = z
+        info['predicted_emb'] = z  # GoalMSE's default key
 
         extra_dims = []
         for key in emb_keys:
@@ -407,6 +435,8 @@ class AdaLNPreJEPA(torch.nn.Module):
         # check if we have already computed the goal embedding for this goal
         if (
             hasattr(self, '_goal_cached_info')
+            and 'id' in info_dict
+            and 'step_idx' in info_dict
             and torch.equal(
                 self._goal_cached_info['id'], info_dict['id'][:, 0]
             )
