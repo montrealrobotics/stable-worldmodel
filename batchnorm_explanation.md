@@ -6,8 +6,9 @@ At the default SIGReg weight (λ = 0.09), ResLeWM with BatchNorm (BN) in its hea
 
 1. **Lowering SIGReg's weight makes the no-norm model as good as BN.** No-norm at λ = 0.009 reaches 26.0% (vs 26.6% for BN); BN is insensitive to λ (26.6 / 25.1 / 26.3 at λ = 0.09 / 0.03 / 0.009).
 2. **The failure is the encoder not learning the T's orientation (yaw).** The no-norm λ = 0.09 model's ViT output barely encodes yaw (linear probe R² 0.22 vs 0.95 for BN), and never learns it: 0.03 at epoch 5, −0.12 at epoch 1. The task requires yaw within 0.15 rad.
-3. **Only the BN in the projector matters.** BN in the projector alone reproduces the full effect (yaw 0.94). BN in the predictor head alone does nothing (0.14).
-4. **Mechanism, confirmed with training logs:** the projector's BN shrinks the SIGReg gradient reaching the encoder by about 8× early in training (norm 54 vs 443). Without it, SIGReg dominates the encoder's update 12.6:1 over the prediction loss, and the weak yaw signal from prediction can't get through. Anything that lowers that ratio (lower λ, projector BN) restores yaw. Partial fixes (LayerNorm heads, a higher learning rate) partially restore it.
+3. **Only the BN in the projector matters.** BN in the projector alone reproduces the full effect (yaw 0.94, 26.2% success). BN in the predictor head alone does nothing (yaw 0.14, 14.5%).
+4. **Mechanism, confirmed with training logs:** the projector's BN shrinks the SIGReg gradient reaching the encoder by about 8× early in training (norm 54 vs 443). Without it, SIGReg dominates the encoder's update 12.6:1 over the prediction loss, and the weak yaw signal from prediction can't get through. Anything that lowers that ratio (lower λ, projector BN) restores yaw. Partial fixes (LayerNorm heads, a higher learning rate) partially restore it, and recover about half the planning gap (22.0% and 20.6%).
+6. **Yaw in the latent is necessary but not sufficient.** Forcing yaw into the no-norm embedding with a supervised head (aux-yaw) recovers only half the gap (20.4%) and barely lowers planned yaw error.
 5. **Isotropy is not what makes a latent good for planning.** The best planners at λ = 0.009 have *less* isotropic latents (effective rank 76–80 of 192, higher SIGReg loss) than the λ = 0.09 BN model (rank 147).
 
 ## 1. Terms
@@ -58,11 +59,24 @@ All 100-episode evals in `evals/sched_n100` use noisy-replay data, identical sta
 | no norm, cosine schedule | 20.3 | 55 | 0.226 | |
 | no norm, λ = 0.09 | 14.2 | 45 | 0.281 | |
 
+Variants at λ = 0.09 (BN placement, partial fixes, aux-yaw from section 7):
+
+| ResLeWM run, λ = 0.09 | Mean success (%) | Best cell | Yaw error at g10/h2 (rad) | vs reference |
+| --- | ---: | ---: | ---: | --- |
+| BN in projector only | 26.2 | 66 | 0.200 | vs BN: −0.4 (32/79) |
+| BN + aux-yaw | 26.1 | 70 | 0.185 | vs BN: −0.6 (39/80) |
+| LayerNorm heads | 22.0 | 55 | 0.257 | vs no norm: **+7.8 (74/80)** |
+| no norm, lr 3e-4 | 20.6 | 64 | 0.209 | vs no norm: +6.4 (65/80) |
+| no norm + aux-yaw | 20.4 | 56 | 0.276 | vs no norm: +6.2 (73/80); vs BN: −6.2 (11/80) |
+| BN in pred_proj only | 14.5 | 49 | 0.252 | vs no norm: +0.2 (37/79) |
+
 - **λ explains the norm effect.** No-norm improves by about 10–12 points just from lowering λ, and the λ = 0.009 runs have the lowest yaw errors of all.
 - **BN makes λ irrelevant:** the three BN weights tie within noise.
 - **The schedule is a partial fix:** decaying λ late in training helps no-norm (+6.1) but not as much as a low constant λ (+5.7 more).
+- **Only projector BN matters, confirmed in planning.** Projector-only BN ties full BN; pred_proj-only BN ties no norm.
+- **The partial fixes are partial in planning too.** LayerNorm heads, lr 3e-4 and aux-yaw each recover about half of the 12-point gap (+6 to +8). None reaches BN or low-λ no-norm.
 
-Evals for the LayerNorm, BN-placement, higher-learning-rate and aux-yaw runs are pending. The conclusions below for those runs rest on the embedding diagnostics and gradient logs.
+One cell is missing for each BN-placement run (bnproj ep10/g20/h3, bnpred ep20/g20/h5); their comparisons use 79 pairs.
 
 ## 4. Where yaw is lost: the encoder
 
@@ -128,8 +142,9 @@ Without BN, the encoder itself must reshape its output to satisfy SIGReg. At λ 
 
 ### 6.3 Partial fixes
 
-- **A higher learning rate** (no norm, lr 3e-4) doesn't change the ratio (14.3), but larger steps let the prediction gradient's small share still make progress: yaw 0.78.
-- **LayerNorm heads** don't block the SIGReg gradient (ratio 14.5, gradient norm 668) yet reach yaw 0.64. Per-sample normalization changes the geometry SIGReg acts through; its gradient is less aligned with prediction (cosine −0.11 vs +0.20). This is less understood. The pending evals will show whether it translates into success.
+- **A higher learning rate** (no norm, lr 3e-4) doesn't change the ratio (14.3), but larger steps let the prediction gradient's small share still make progress: yaw 0.78. Planning: 20.6% (+6.4 over no norm, 6 below BN).
+- **LayerNorm heads** don't block the SIGReg gradient (ratio 14.5, gradient norm 668) yet reach yaw 0.64. Per-sample normalization changes the geometry SIGReg acts through; its gradient is less aligned with prediction (cosine −0.11 vs +0.20). This is less understood. Planning: 22.0% (+7.8 over no norm, 4.6 below BN).
+- The yaw probe doesn't rank these two: lr 3e-4 has the higher probe (0.78 vs 0.64) but the lower success (20.6 vs 22.0). The difference is small for one seed.
 - **The SIGReg schedule** only lowers λ late in training. But yaw has to be learned early, when the ratio is highest, so the schedule recovers only part of the gap.
 
 ## 7. Supervised yaw (aux-yaw diagnostic)
@@ -140,8 +155,28 @@ A linear head trained to predict yaw from the embedding (weight 0.1, privileged 
 | --- | ---: | ---: | ---: | ---: |
 | Yaw probe, embedding | 0.99 | 0.95 | 0.90 | 0.17 |
 | Yaw probe, CLS | 0.97 | 0.77 | 0.95 | 0.22 |
+| Mean success (%) | 26.1 | 20.4 | 26.6 | 14.2 |
+| Yaw error at g10/h2 (rad) | 0.185 | 0.276 | 0.175 | 0.281 |
 
-Supervision gets yaw in, even through the no-norm encoder. Its evals will answer the open question: if no-norm + aux plans like BN, missing yaw fully explains the gap. If it doesn't, something else (dynamics, cost weighting) also matters.
+Supervision gets yaw in, even through the no-norm encoder, but **missing yaw doesn't fully explain the gap.**
+
+- **No norm + aux recovers half the gap:** +6.2 over no norm (better in 73/80), still 6.2 below BN (better in only 11/80).
+- **Its planned yaw barely improves** (0.276 vs 0.281 rad at g10/h2), even though yaw is now linearly decodable from the embedding (0.95). The success gain must come from elsewhere, for example a better-shaped latent overall.
+- **Linearly decodable is not the same as plannable.** Diagnostics at epoch 20 (same 2048 samples) rule out the two simple explanations:
+
+  | Epoch 20 | Yaw share of embedding variance | T xy share | EEF share | One-step error | Yaw probe, CLS |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | BN | 1.4% | 1.5% | 1.4% | 0.048 | 0.95 |
+  | BN + aux | 1.5% | 1.5% | 1.4% | 0.046 | 0.97 |
+  | no norm + aux | 1.2% | 1.7% | 1.4% | 0.040 | 0.77 |
+  | no norm | 0.1% | 2.0% | 1.5% | 0.035 | 0.22 |
+  | no norm λ=0.009 | 2.9% | 3.8% | 3.4% | 0.014 | 0.89 |
+
+  - **Cost weighting is not it:** no-norm + aux gives yaw almost the same share of the planning cost as BN (1.2% vs 1.4%).
+  - **Average one-step error is not it:** 0.040, better than BN's 0.048.
+  - **What differs:** the encoder itself still carries less yaw (CLS probe 0.77 vs 0.95). The aux head builds yaw in the projector from a weaker encoder signal. The open suspect is yaw-specific dynamics: one-step error averages over all factors, so it can hide a predictor that doesn't move yaw correctly. Next check: probe yaw on *predicted* embeddings over multi-step rollouts.
+  - The best planner (no norm, λ = 0.009) gives every task factor about twice the variance share (yaw 2.9%, T xy 3.8%) and has a 3× lower one-step error.
+- **BN + aux changes nothing** (−0.6): once yaw is present, more of it doesn't help.
 
 ## 8. Isotropy is not the goal
 
@@ -151,7 +186,7 @@ Supervision gets yaw in, even through the no-norm encoder. Its evals will answer
 | BN λ=0.009 | 80 | 6.1 | 0.015 | 26.3 |
 | BN λ=0.09 | 147 | 2.3 | 0.048 | 26.6 |
 | no norm λ=0.09 | 134 | 2.8 | 0.035 | 14.2 |
-| no norm lr 3e-4 | 170 | 1.8 | 0.027 | pending |
+| no norm lr 3e-4 | 170 | 1.8 | 0.027 | 20.6 |
 | classic LeWM BN λ=0.09 | 154 | 2.0 | 0.035 | 21.3 |
 
 - **Low-λ latents are far less isotropic yet plan best.** They also predict more accurately (one-step error 0.014 vs 0.048).
@@ -185,7 +220,7 @@ The lesson here is specific to regularizer-based methods: a batch-statistics reg
 - **Small diagnostic sample:** 2048 transitions, BN in eval mode.
 - **The 5-epoch early runs** use a different learning-rate schedule from the 20-epoch runs; compare trends, not values.
 - **The gradient ratio is logged every 100 steps**, averaged over phases.
-- **Evals pending** for the LayerNorm, BN-placement, lr 3e-4 and aux-yaw runs.
+- **Partial-fix differences** (LayerNorm 22.0, lr 3e-4 20.6, no norm + aux 20.4) are within 2 points of each other and not ranked reliably.
 
 ## 11. Practical guidance
 
@@ -193,7 +228,7 @@ The lesson here is specific to regularizer-based methods: a batch-statistics reg
 - **If you drop projector BN,** lower λ to about 0.01. The decaying schedule doesn't substitute.
 - **Don't judge latents by SIGReg loss or rank.** Probe the task factors (yaw, T xy, EEF), and watch `fit/relative_grad_magnitude`: values well above ~3 early in training predict the yaw failure.
 - **Next experiments:**
-  1. Evaluate the pending runs.
+  1. Probe yaw on predicted embeddings over multi-step rollouts (aux-yaw runs vs BN) to test whether the predictor moves yaw correctly.
   2. Sweep λ lower (0.003, 0.001, 0) for BN and no-norm, to find where collapse starts.
   3. Vary the noisy/expert ratio.
   4. Try InfoNCE as a replacement for SIGReg.
