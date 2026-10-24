@@ -156,19 +156,28 @@ Before the shared goal cache; 20 episodes per eval, so compare only means. Setti
 - **RMSNorm ≈ no norm** (11.5 vs 11.6, clean data).
 - **Clean vs noisy, BN, image-only:** 14.9 → 23.5. Noisy data mainly fixes end-effector placement (EEF error at g10/h2: 0.137 → 0.060 m).
 
-## In progress
+## DINO-WM baseline (frozen DINOv3 ViT-S/16, 128 px, AdaLN predictor)
+
+Batch 128, lr 5e-4, cosine to 0 over 10 epochs (spt's default when `warmup_ratio` is null). Checkpoints at epochs 3/5/8/10. Patch evals ran only h1–h2 at every checkpoint (h3 at ep10), so all rows below average **h1–h2** over 4 checkpoints × 4 goal offsets; the ResLeWM reference is recomputed on the same cells (its 80-cell mean is 26.6).
+
+| Run | Tokens/frame | Val loss | h1–2 mean | g10 | g15 | g20 | g25 | h2 mean | Best cell |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ResLeWM, BN, λ 0.09 (`noisy_lewm_res_bn_11308936`, reference) | 1 | – | **33.4** | 55.6 | 37.4 | 23.5 | 17.1 | 41.1 | 69 |
+| `noisy_dinowm3_patches_11333908` | 64 | 0.0035 | **19.4** | 41.2 | 22.4 | 9.4 | 4.8 | 21.9 | 50 |
+| `noisy_dinowm3_clsreg_11338409` (CLS + 4 registers) | 5 | – | **1.5** | 2.7 | 1.7 | 1.0 | 0.6 | 1.8 | 5 |
+| `noisy_dinowm3_cls_11333907` | 1 | 0.056 | **1.1** | 2.0 | 1.5 | 0.0 | 1.0 | 1.8 | 4 |
+
+- **Patch DINO-WM plans 14 points below ResLeWM** at matched cells, and the gap is relatively larger for far goals (g25: 4.8 vs 17.1). Per-checkpoint h1–2 means are flat (20.1 / 17.4 / 20.2 / 20.0). h3 at ep10: 46 / 29 / 11 / 7 for g10–g25.
+- **Both CLS runs froze:** predictor weights are bit-identical from epoch 3 (CLS) and from epoch 2 (CLS+reg), so their evals are the same at every checkpoint (small differences are CEM noise). Patch weights keep changing every epoch. The CLS results are not a fair test of the CLS representation until the freeze is fixed.
+- CLS+reg has 18/80 cells missing (OOM with 5 horizons per GPU); mean over its 62 finished cells ≈ 1.6.
 
 | Job | Run | Status |
 | --- | --- | --- |
-| 11333907 | DINO-WM, frozen DINOv3 ViT-S/16, CLS token, batch 128, lr 5e-4 | training, epoch 9/10 |
-| 11333908 | DINO-WM, 64 patch tokens, batch 128, lr 5e-4 | training, epoch 8/10 |
-| not submitted | DINO-WM, CLS token, batch 1024, lr 1.4e-3, warmup + cosine | command ready |
-
-Evaluate at epochs 3/5/8/10 on the same grid (patch model may need a smaller `solver.batch_size`).
+| 11337977 / 11337978 | cls+reg / patches, batch 1024, lr 1.4e-3, warmup 0.01 | trained; not evaluated |
 
 ## Next steps
 
-1. DINO-WM evals once training finishes.
+1. DINO-WM: find why the CLS predictors stop updating (epoch 2–3), then rerun; decide whether to evaluate the batch-1024 patch run.
 2. SIGReg weight below 0.009 (0.003, 0.001, 0) for BN and no norm, to find where collapse starts.
 3. Probe yaw on predicted latents over multi-step rollouts (aux-yaw follow-up).
 4. Far-goal planning: orientation error dominates at g ≥ 20.
