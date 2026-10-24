@@ -93,6 +93,40 @@ class SaveCkptCallback(Callback):
 # ---------------------------------------------------------------------------
 
 
+class GradNormModule(spt.Module):
+    """Logs the gradient norm before clipping and warns when it is not finite.
+
+    Clipping by global norm zeroes every gradient without error once the norm
+    overflows to inf (any element above ~1.8e19), which froze the CLS runs.
+    """
+
+    nonfinite_steps = 0
+
+    def after_manual_backward(self):
+        grads = [p.grad for p in self.parameters() if p.grad is not None]
+        if not grads:
+            return
+        norm = torch.nn.utils.get_total_norm(grads)
+        max_abs = torch.stack([g.abs().max() for g in grads]).max()
+        self.log('fit/grad_norm', norm, on_step=True, on_epoch=False)
+        self.log('fit/grad_max_abs', max_abs, on_step=True, on_epoch=False)
+        if not torch.isfinite(norm):
+            self.nonfinite_steps += 1
+            n = self.nonfinite_steps
+            if n <= 10 or n % 1000 == 0:
+                logging.warning(
+                    f'Non-finite grad norm at step {self.global_step} '
+                    f'(max |grad| {max_abs.item():.3g}); clipping will zero '
+                    f'all gradients. {n} such steps so far.'
+                )
+        self.log(
+            'fit/nonfinite_grad_steps',
+            float(self.nonfinite_steps),
+            on_step=True,
+            on_epoch=False,
+        )
+
+
 def dinowm_forward(self, batch, stage, cfg):
     """Encode observations, predict next states, compute losses."""
     for key in self.model.extra_encoders:
@@ -320,7 +354,7 @@ def run(cfg):
             'warmup_steps': max(1, int(warmup_ratio * total_steps)),
             'max_steps': total_steps,
         }
-    world_model = spt.Module(
+    world_model = GradNormModule(
         model=world_model,
         forward=partial(dinowm_forward, cfg=cfg),
         optim={'model_opt': optim},
