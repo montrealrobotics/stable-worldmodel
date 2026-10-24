@@ -256,10 +256,13 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
 
     results_path.mkdir(parents=True, exist_ok=True)
-    print(
-        f'[eval] saving videos to {results_path.resolve()} '
-        '(videos follow the seed order in the results)'
-    )
+    # ++save_videos=false skips the per-episode mp4s (100 files per eval).
+    video_path = results_path if cfg.get('save_videos', True) else None
+    if video_path:
+        print(
+            f'[eval] saving videos to {results_path.resolve()} '
+            '(videos follow the seed order in the results)'
+        )
 
     autocast_ctx = torch.autocast(
         device_type='cuda',
@@ -278,18 +281,19 @@ def run(cfg: DictConfig):
             warmup_kwargs = dict(eval_kwargs)
             if 'episodes' in warmup_kwargs:
                 warmup_kwargs['episodes'] = world.num_envs
-            world.evaluate(**warmup_kwargs, video=results_path)
+            world.evaluate(**warmup_kwargs, video=video_path)
         print('Warmup done.')
 
     print('[eval] starting evaluation...', flush=True)
     start_time = time.time()
     with autocast_ctx:
-        metrics = world.evaluate(**eval_kwargs, video=results_path)
+        metrics = world.evaluate(**eval_kwargs, video=video_path)
     end_time = time.time()
 
     world.close()
     print(metrics)
-    print(f'[eval] videos saved to {results_path.resolve()}')
+    if video_path:
+        print(f'[eval] videos saved to {results_path.resolve()}')
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)

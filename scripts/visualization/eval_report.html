@@ -285,9 +285,15 @@ const shortCase = (e) => {
 };
 
 const selectionKey = 'selected:' + runs.map((r) => r.name).join('|');
-let selected = new Set(store.get(selectionKey) ?? runs.map((r) => r.id));
+// Large reports start with only the best runs selected; drawing every run's
+// episodes at once can freeze the page.
+const DEFAULT_MAX_RUNS = 60;
+const defaultSelection = () => [...runs]
+  .sort((a, b) => b.success_rate - a.success_rate)
+  .slice(0, DEFAULT_MAX_RUNS).map((r) => r.id);
+let selected = new Set(store.get(selectionKey) ?? defaultSelection());
 selected = new Set([...selected].filter((id) => runs.some((r) => r.id === id)));
-if (!selected.size) selected = new Set(runs.map((r) => r.id));
+if (!selected.size) selected = new Set(defaultSelection());
 let filterText = '';
 const facetNames = [...new Set(runs.flatMap((r) => Object.keys(r.facets || {})))];
 const facetOf = (r, f) => r.facets?.[f] ?? '—';
