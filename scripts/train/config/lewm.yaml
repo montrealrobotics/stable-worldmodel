@@ -70,6 +70,8 @@ model:
     dim_head: 64
     dropout: 0.1
     emb_dropout: 0.0
+    # false drops the attention/MLP LayerNorm that follows AdaLN's norm + modulation
+    inner_norm: true
   action_encoder:
     _target_: stable_worldmodel.wm.lewm.module.Embedder
     input_dim: ???

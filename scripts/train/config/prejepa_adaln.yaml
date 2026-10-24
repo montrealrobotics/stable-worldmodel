@@ -57,6 +57,8 @@ predictor:
   dim_head: 64
   dropout: 0.1
   emb_dropout: 0.0
+  # false drops the attention/MLP LayerNorm that follows AdaLN's norm + modulation
+  inner_norm: true
 
 model:
   _target_: stable_worldmodel.wm.AdaLNPreJEPA
@@ -80,6 +82,7 @@ model:
     dim_head: ${predictor.dim_head}
     dropout: ${predictor.dropout}
     emb_dropout: ${predictor.emb_dropout}
+    inner_norm: ${predictor.inner_norm}
     condition_dim: ???
 
 # --- Optimizer ---

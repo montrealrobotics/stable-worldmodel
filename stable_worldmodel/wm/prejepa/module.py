@@ -174,6 +174,7 @@ class AdaLNCausalPredictor(nn.Module):
         condition_dim=None,
         condition_from='full',
         hidden_dim=None,
+        inner_norm=True,
         **kwargs,
     ):
         super().__init__()
@@ -215,6 +216,7 @@ class AdaLNCausalPredictor(nn.Module):
             num_patches,
             num_frames,
             condition_dim=self.condition_dim,
+            inner_norm=inner_norm,
         )
         self.pool = pool
 
@@ -239,10 +241,10 @@ class AdaLNCausalPredictor(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.0):
+    def __init__(self, dim, hidden_dim, dropout=0.0, norm=True):
         super().__init__()
         self.net = nn.Sequential(
-            nn.LayerNorm(dim),
+            nn.LayerNorm(dim) if norm else nn.Identity(),
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -263,13 +265,14 @@ class Attention(nn.Module):
         dropout=0.0,
         num_patches=1,
         num_frames=1,
+        norm=True,
     ):
         super().__init__()
         inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
         self.heads = heads
         self.scale = dim_head**-0.5
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm(dim) if norm else nn.Identity()
         self.attend = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
@@ -373,8 +376,11 @@ class AdaLNBlock(nn.Module):
         dropout=0.0,
         num_patches=1,
         num_frames=1,
+        inner_norm=True,
     ):
         super().__init__()
+        # inner_norm=False drops the sublayers' own LayerNorm, which follows
+        # norm1/norm2 + modulation and undoes the uniform part of the scale.
         self.attn = Attention(
             dim,
             heads=heads,
@@ -382,8 +388,9 @@ class AdaLNBlock(nn.Module):
             dropout=dropout,
             num_patches=num_patches,
             num_frames=num_frames,
+            norm=inner_norm,
         )
-        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout, norm=inner_norm)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.adaLN_modulation = nn.Sequential(
@@ -418,6 +425,7 @@ class AdaLNTransformer(nn.Module):
         num_patches=1,
         num_frames=1,
         condition_dim=None,
+        inner_norm=True,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
@@ -437,6 +445,7 @@ class AdaLNTransformer(nn.Module):
                     dropout=dropout,
                     num_patches=num_patches,
                     num_frames=num_frames,
+                    inner_norm=inner_norm,
                 )
             )
 

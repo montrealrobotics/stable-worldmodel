@@ -16,10 +16,10 @@ def modulate(x, shift, scale):
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""
 
-    def __init__(self, dim, hidden_dim, dropout=0.0):
+    def __init__(self, dim, hidden_dim, dropout=0.0, norm=True):
         super().__init__()
         self.net = nn.Sequential(
-            nn.LayerNorm(dim),
+            nn.LayerNorm(dim) if norm else nn.Identity(),
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -34,14 +34,14 @@ class FeedForward(nn.Module):
 class Attention(nn.Module):
     """Scaled dot-product attention with causal masking"""
 
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, norm=True):
         super().__init__()
         inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
         self.heads = heads
         self.scale = dim_head**-0.5
         self.dropout = dropout
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm(dim) if norm else nn.Identity()
         self.attend = nn.Softmax(dim=-1)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.to_out = (
@@ -77,13 +77,18 @@ class Attention(nn.Module):
 class ConditionalBlock(nn.Module):
     """Transformer block with AdaLN-zero conditioning"""
 
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+    def __init__(
+        self, dim, heads, dim_head, mlp_dim, dropout=0.0, inner_norm=True
+    ):
         super().__init__()
-
+        # inner_norm=False drops the sublayers' own LayerNorm, which follows
+        # norm1/norm2 and (in ConditionalBlock) undoes the uniform part of
+        # the AdaLN scale.
         self.attn = Attention(
-            dim, heads=heads, dim_head=dim_head, dropout=dropout
+            dim, heads=heads, dim_head=dim_head, dropout=dropout,
+            norm=inner_norm,
         )
-        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout, norm=inner_norm)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.adaLN_modulation = nn.Sequential(
@@ -110,13 +115,18 @@ class ConditionalBlock(nn.Module):
 class Block(nn.Module):
     """Standard Transformer block"""
 
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+    def __init__(
+        self, dim, heads, dim_head, mlp_dim, dropout=0.0, inner_norm=True
+    ):
         super().__init__()
-
+        # inner_norm=False drops the sublayers' own LayerNorm, which follows
+        # norm1/norm2 and (in ConditionalBlock) undoes the uniform part of
+        # the AdaLN scale.
         self.attn = Attention(
-            dim, heads=heads, dim_head=dim_head, dropout=dropout
+            dim, heads=heads, dim_head=dim_head, dropout=dropout,
+            norm=inner_norm,
         )
-        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout, norm=inner_norm)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
@@ -140,6 +150,7 @@ class Transformer(nn.Module):
         mlp_dim,
         dropout=0.0,
         block_class=Block,
+        inner_norm=True,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
@@ -165,7 +176,9 @@ class Transformer(nn.Module):
 
         for _ in range(depth):
             self.layers.append(
-                block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
+                block_class(
+                    hidden_dim, heads, dim_head, mlp_dim, dropout, inner_norm
+                )
             )
 
     def forward(self, x, c=None, attn_mask=None):
@@ -265,6 +278,7 @@ class Predictor(nn.Module):
         dim_head=64,
         dropout=0.0,
         emb_dropout=0.0,
+        inner_norm=True,
     ):
         super().__init__()
         self.num_frames = num_frames
@@ -290,6 +304,7 @@ class Predictor(nn.Module):
             mlp_dim,
             dropout,
             block_class=ConditionalBlock,
+            inner_norm=inner_norm,
         )
 
     def forward(self, x, c):
