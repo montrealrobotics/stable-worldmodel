@@ -64,16 +64,37 @@ def get_img_preprocessor(
 class SaveCkptCallback(Callback):
     """Save the model with save_pretrained every ``epoch_interval`` epochs.
 
-    Also saves the final weights when training ends off-interval, including
-    a partial last epoch when ``max_steps`` stops training.
+    With ``step_interval``, also saves weights_step_N.pt every N optimizer
+    steps (for step-based runs that last only a few epochs). Also saves the
+    final weights when training ends off-interval, including a partial last
+    epoch when ``max_steps`` stops training.
     """
 
-    def __init__(self, run_name, cfg, epoch_interval: int = 1):
+    def __init__(
+        self, run_name, cfg, epoch_interval: int = 1, step_interval=None
+    ):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
         self.epoch_interval = epoch_interval
+        self.step_interval = step_interval
         self._saved_epoch = None
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, idx):
+        super().on_train_batch_end(trainer, pl_module, outputs, batch, idx)
+        step = trainer.global_step
+        if (
+            self.step_interval
+            and trainer.is_global_zero
+            and step > 0
+            and step % self.step_interval == 0
+        ):
+            save_pretrained(
+                pl_module.model,
+                run_name=self.run_name,
+                config=self.cfg,
+                filename=f'weights_step_{step}.pt',
+            )
 
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
@@ -453,6 +474,10 @@ def run(cfg):
         run_name=cfg.output_model_name,
         cfg=cfg.model,
         epoch_interval=cfg.get('save_epoch_interval', 1),
+        # Step-based runs may never reach an epoch interval.
+        step_interval=cfg.get('save_step_interval')
+        if cfg.trainer.max_steps > 0
+        else None,
     )
 
     trainer = pl.Trainer(

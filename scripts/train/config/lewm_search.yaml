@@ -5,6 +5,7 @@ defaults:
 
 init_from: ??? # pretrained LeWM weights_epoch_N.pt or folder
 output_model_name: lewm_search
+save_step_interval: 2500 # weights_step_N.pt; runs end before epoch 5
 
 data:
   dataset:
