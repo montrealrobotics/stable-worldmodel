@@ -334,3 +334,30 @@ def test_rollout_without_layernorm_attribute_matches_default():
     del model.rollout_layernorm  # Older whole-object checkpoints.
     actual = model.rollout(dict(info), actions)['predicted_emb']
     torch.testing.assert_close(actual, expected)
+
+
+def test_mlp_weight_norm_is_mode_independent():
+    from stable_worldmodel.wm.lewm.module import MLP
+
+    torch.manual_seed(0)
+    mlp = MLP(8, 16, norm_fn=None, weight_norm=True)
+    names = {n for n, _ in mlp.named_parameters()}
+    assert 'net.0.parametrizations.weight.original0' in names  # g
+    assert 'net.3.parametrizations.weight.original1' in names  # v
+    x = torch.randn(4, 8)
+    out = mlp.train()(x)
+    assert torch.equal(out, mlp.eval()(x))
+    assert out.shape == (4, 8)
+
+
+def test_mlp_fix_last_g_gives_unit_rows():
+    from stable_worldmodel.wm.lewm.module import MLP
+
+    mlp = MLP(8, 16, norm_fn=None, weight_norm=True, fix_last_g=True)
+    g = mlp.net[3].parametrizations.weight.original0
+    assert not g.requires_grad
+    torch.testing.assert_close(mlp.net[3].weight.norm(dim=1), torch.ones(8))
+    mlp(torch.randn(4, 8)).sum().backward()
+    assert g.grad is None
+    with pytest.raises(ValueError):
+        MLP(8, 16, fix_last_g=True)

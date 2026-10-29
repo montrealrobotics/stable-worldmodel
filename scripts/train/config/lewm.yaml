@@ -84,6 +84,9 @@ model:
     norm_fn:
       _target_: torch.nn.BatchNorm1d
       _partial_: true
+    # weight-normalized linears (no batch stats); fix_last_g needs weight_norm
+    weight_norm: false
+    fix_last_g: false
   pred_proj:
     _target_: stable_worldmodel.wm.lewm.module.MLP
     input_dim: ${embed_dim}
@@ -92,6 +95,9 @@ model:
     norm_fn:
       _target_: torch.nn.BatchNorm1d
       _partial_: true
+    # weight-normalized linears (no batch stats); fix_last_g needs weight_norm
+    weight_norm: false
+    fix_last_g: false
 
 loss:
   sigreg:

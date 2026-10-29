@@ -232,8 +232,27 @@ class Embedder(nn.Module):
         return x
 
 
+def weight_norm_linear(in_dim, out_dim, fix_g=False, bias=True):
+    """Linear with w = g * v / ||v||; fix_g fixes g to 1 and freezes it."""
+    linear = nn.utils.parametrizations.weight_norm(
+        nn.Linear(in_dim, out_dim, bias=bias)
+    )
+    if fix_g:
+        g = linear.parametrizations.weight.original0
+        g.data.fill_(1.0)
+        g.requires_grad_(False)
+    return linear
+
+
 class MLP(nn.Module):
-    """Simple MLP with optional normalization and activation"""
+    """Simple MLP with optional normalization and activation
+
+    ``weight_norm`` reparametrizes both linear layers as w = g * v / ||v||.
+    Unlike BatchNorm it uses no batch statistics, so train and eval mode
+    behave the same. ``fix_last_g`` additionally fixes the last layer's g
+    to 1 and freezes it, as in DINO's projection head, so each output row
+    is a unit vector.
+    """
 
     def __init__(
         self,
@@ -242,18 +261,28 @@ class MLP(nn.Module):
         output_dim=None,
         norm_fn=nn.LayerNorm,
         act_fn=nn.GELU,
+        weight_norm=False,
+        fix_last_g=False,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim or input_dim
         norm_fn = norm_fn(hidden_dim) if norm_fn is not None else nn.Identity()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            norm_fn,
-            act_fn(),
-            nn.Linear(hidden_dim, output_dim or input_dim),
-        )
+        out_dim = output_dim or input_dim
+        if weight_norm:
+            linears = [
+                weight_norm_linear(input_dim, hidden_dim),
+                weight_norm_linear(hidden_dim, out_dim, fix_last_g),
+            ]
+        elif fix_last_g:
+            raise ValueError('fix_last_g requires weight_norm=True')
+        else:
+            linears = [
+                nn.Linear(input_dim, hidden_dim),
+                nn.Linear(hidden_dim, out_dim),
+            ]
+        self.net = nn.Sequential(linears[0], norm_fn, act_fn(), linears[1])
 
     def forward(self, x):
         """
