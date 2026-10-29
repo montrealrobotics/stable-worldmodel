@@ -379,6 +379,41 @@ def test_recurrent_action_encoder_is_causal_over_time():
     assert not torch.allclose(out[:, 2:], out2[:, 2:])
 
 
+def test_oneshot_rollout_matches_predict():
+    from stable_worldmodel.wm.lewm import LeWMOneShotRes
+    from stable_worldmodel.wm.lewm.module import (
+        Predictor,
+        RecurrentActionEncoder,
+    )
+
+    torch.manual_seed(0)
+    model = LeWMOneShotRes(
+        encoder=None,
+        predictor=Predictor(num_frames=1, depth=1, heads=2, mlp_dim=16,
+                            input_dim=8, hidden_dim=8, dim_head=4),
+        action_encoder=RecurrentActionEncoder(4, 8, depth=1,
+                                              heads=2, dim_head=4,
+                                              mlp_dim=16),
+    ).eval()
+    emb = torch.randn(B, S, 1, 8)
+    actions = torch.randn(B, S, 5, 4)
+    info = {'pixels': torch.randn(B, S, 1, 3, 8, 8), 'emb': emb}
+    out = model.rollout(info, actions)['predicted_emb']
+    assert out.shape == (B, S, 6, 8)
+    torch.testing.assert_close(out[:, :, 0], emb[:, :, 0])
+    preds = model.predict({
+        'emb': emb.flatten(0, 1),
+        'act_emb': model.action_encoder(actions.flatten(0, 1)),
+    })['preds']
+    torch.testing.assert_close(out[:, :, 1:], preds.unflatten(0, (B, S)))
+    # a shorter plan gives the same prefix: prediction k uses actions 0..k only
+    short = model.rollout(dict(info), actions[:, :, :3])['predicted_emb']
+    torch.testing.assert_close(short, out[:, :, :4])
+    with pytest.raises(ValueError):
+        model.predict({'emb': torch.randn(2, 2, 8),
+                       'act_emb': torch.randn(2, 1, 8)})  # no target
+
+
 @pytest.mark.parametrize(
     'kwargs',
     [
@@ -431,3 +466,41 @@ def test_recurrent_action_encoder_rms_wn_bounds_coordinates():
     assert enc.out_proj.bias is None
     out = enc(torch.randn(16, 10, 6) * 100)
     assert out.abs().max() <= 8**0.5 + 1e-4  # sqrt(D) * cos
+
+
+def test_oneshot_history_uses_past_actions_and_matches_training():
+    from stable_worldmodel.wm.lewm import LeWMOneShotRes
+    from stable_worldmodel.wm.lewm.module import (
+        Predictor,
+        RecurrentActionEncoder,
+    )
+
+    torch.manual_seed(0)
+    Hc = 3
+    model = LeWMOneShotRes(
+        encoder=None,
+        predictor=Predictor(num_frames=Hc, depth=1, heads=2, mlp_dim=16,
+                            input_dim=8, hidden_dim=8, dim_head=4),
+        action_encoder=RecurrentActionEncoder(4, 8, depth=1, heads=2,
+                                              dim_head=4, mlp_dim=16),
+    ).eval()
+    # break AdaLN-zero so conditioning matters
+    for p in model.predictor.parameters():
+        p.data.add_(0.1 * torch.randn_like(p))
+    emb = torch.randn(B, S, Hc, 8)
+    past = torch.randn(B, S, Hc - 1, 4)
+    plan = torch.randn(B, S, 4, 4)
+    info = {'pixels': torch.randn(B, S, Hc, 3, 8, 8), 'emb': emb,
+            'action_history': past}
+    out = model.rollout(dict(info), plan)['predicted_emb']
+    assert out.shape == (B, S, Hc + 4, 8)
+    torch.testing.assert_close(out[:, :, :Hc], emb)
+    # same as the training path: encoder over the whole clip of actions
+    acts = torch.cat([past, plan], 2).flatten(0, 1)
+    preds = model.predict({'emb': emb.flatten(0, 1),
+                           'act_emb': model.action_encoder(acts)})['preds']
+    torch.testing.assert_close(out[:, :, Hc:], preds.unflatten(0, (B, S)))
+    # past actions change the prediction
+    other = dict(info, action_history=past + 1.0)
+    assert not torch.allclose(model.rollout(other, plan)['predicted_emb'],
+                              out)

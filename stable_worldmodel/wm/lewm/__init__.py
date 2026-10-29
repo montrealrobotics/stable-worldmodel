@@ -1,4 +1,5 @@
 from .lewm import LeWM
+from .lewm_oneshot import LeWMOneShotRes
 from .lewm_patch import LeWMPatch, PatchPredictor
 from .lewm_preln import LeWMPreLN
 from .lewm_proprio import LeWMProprio, LeWMProprioRes
@@ -10,6 +11,7 @@ ResLeWM = LeWMRes
 
 __all__ = [
     'LeWM',
+    'LeWMOneShotRes',
     'LeWMPatch',
     'LeWMPreLN',
     'LeWMProprio',

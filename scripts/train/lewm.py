@@ -271,8 +271,12 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_info = {}
     ctx_info['emb'] = emb[:, :ctx_len]
     ctx_info['act_emb'] = act_emb[:, :ctx_len]
-
     tgt_emb = emb[:, n_preds : n_preds + ctx_len]  # label
+    if getattr(self.model, 'one_shot', False):
+        # cumulative act_emb; the last context frame uses one per target
+        ctx_info['act_emb'] = act_emb[:, : ctx_len - 1 + n_preds]
+        tgt_emb = emb[:, ctx_len : ctx_len + n_preds]
+
     pred_emb = self.model.predict(ctx_info)['preds']  # pred
 
     # LeWM loss
@@ -300,6 +304,12 @@ def lejepa_forward(self, batch, stage, cfg):
         f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k
     }
     losses_dict[f'{stage}/sigreg_weight'] = float(lambd)
+    if getattr(self.model, 'one_shot', False):
+        # scale of the recurrent action state per horizon (drift check)
+        future = ctx_info['act_emb'][:, ctx_len - 1 :].detach().float()
+        norms = future.norm(dim=-1).mean(0)
+        for k, v in enumerate(norms, 1):
+            losses_dict[f'{stage}/act_emb_norm_h{k}'] = v
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
 
     interval = cfg.get('gradient_diagnostics_interval', 100)

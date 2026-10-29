@@ -1,0 +1,28 @@
+# Recurrent action encoding over time + one-shot prediction: a CLS
+# transformer encodes actions a_1..a_k into h_k, and z_{t+k} = z_t + f(z_t, h_k)
+# for all k at once (no latent autoregression).
+defaults:
+  - lewm
+  - _self_
+
+output_model_name: lewm_res_oneshot
+
+wm:
+  history_size: 1 # context frames; >1 also feeds past actions to the encoder
+  num_preds: 5 # training horizon K in (frameskip) action steps
+
+model:
+  _target_: stable_worldmodel.wm.lewm.LeWMOneShotRes
+  action_encoder:
+    _target_: stable_worldmodel.wm.lewm.module.RecurrentActionEncoder
+    depth: 2
+    heads: 4
+    dim_head: 64
+    mlp_dim: 512
+    dropout: 0.0
+    # last norm on h each step: affine (LayerNorm), plain (no scale/shift),
+    # rms (RMSNorm, no scale), none
+    final_norm: affine
+    # bias-free weight-normalized linear on h; fix_g fixes g to 1 (needs WN)
+    weight_norm: false
+    fix_g: false
