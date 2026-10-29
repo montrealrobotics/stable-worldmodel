@@ -361,3 +361,73 @@ def test_mlp_fix_last_g_gives_unit_rows():
     assert g.grad is None
     with pytest.raises(ValueError):
         MLP(8, 16, fix_last_g=True)
+
+
+def test_recurrent_action_encoder_is_causal_over_time():
+    from stable_worldmodel.wm.lewm.module import RecurrentActionEncoder
+
+    torch.manual_seed(0)
+    enc = RecurrentActionEncoder(6, 8, depth=1, heads=2,
+                                 dim_head=4, mlp_dim=16).eval()
+    x = torch.randn(2, 4, 6)
+    out = enc(x)
+    assert out.shape == (2, 4, 8)
+    y = x.clone()
+    y[:, 2] += 1.0  # changes h_3 onward only
+    out2 = enc(y)
+    torch.testing.assert_close(out[:, :2], out2[:, :2])
+    assert not torch.allclose(out[:, 2:], out2[:, 2:])
+
+
+@pytest.mark.parametrize(
+    'kwargs',
+    [
+        {'final_norm': 'affine'},
+        {'final_norm': 'plain'},
+        {'final_norm': 'none'},
+        {'weight_norm': True},
+        {'final_norm': 'rms'},
+        {'final_norm': 'none', 'weight_norm': True, 'fix_g': True},
+        {'final_norm': 'rms', 'weight_norm': True, 'fix_g': True},
+    ],
+)
+def test_recurrent_action_encoder_options(kwargs):
+    from stable_worldmodel.wm.lewm.module import RecurrentActionEncoder
+
+    torch.manual_seed(0)
+    enc = RecurrentActionEncoder(6, 8, depth=1, heads=2, dim_head=4,
+                                 mlp_dim=16, **kwargs)
+    out = enc(torch.randn(3, 5, 6))
+    assert out.shape == (3, 5, 8)
+    if kwargs.get('final_norm', 'affine') != 'none' and not kwargs.get(
+        'weight_norm'
+    ):  # LayerNorm output: norm sqrt(D) at every step
+        torch.testing.assert_close(
+            out.norm(dim=-1), torch.full((3, 5), 8**0.5), rtol=1e-3, atol=1e-3
+        )
+    if kwargs.get('fix_g'):
+        g = enc.out_proj.parametrizations.weight.original0
+        assert not g.requires_grad
+        torch.testing.assert_close(enc.out_proj.weight.norm(dim=1),
+                                   torch.ones(8))
+
+
+def test_recurrent_action_encoder_rejects_bad_options():
+    from stable_worldmodel.wm.lewm.module import RecurrentActionEncoder
+
+    with pytest.raises(ValueError):
+        RecurrentActionEncoder(6, 8, final_norm='batch')
+    with pytest.raises(ValueError):
+        RecurrentActionEncoder(6, 8, fix_g=True)
+
+
+def test_recurrent_action_encoder_rms_wn_bounds_coordinates():
+    from stable_worldmodel.wm.lewm.module import RecurrentActionEncoder
+
+    torch.manual_seed(0)
+    enc = RecurrentActionEncoder(6, 8, depth=1, heads=2, dim_head=4,
+                                 mlp_dim=16, final_norm='rms',
+                                 weight_norm=True, fix_g=True)
+    assert enc.out_proj.bias is None
+    out = enc(torch.randn(16, 10, 6) * 100)
+    assert out.abs().max() <= 8**0.5 + 1e-4  # sqrt(D) * cos

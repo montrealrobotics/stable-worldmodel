@@ -244,6 +244,82 @@ def weight_norm_linear(in_dim, out_dim, fix_g=False, bias=True):
     return linear
 
 
+class RecurrentActionEncoder(nn.Module):
+    """Encode the action sequence recurrently over time with a CLS token.
+
+    Step t runs a small transformer over [h_{t-1}, a_t], the carried CLS
+    state and the action at time t (one token, e.g. a 10-d frameskip-5
+    PushT action), with bidirectional attention. Its output CLS is h_t,
+    which summarizes a_1..a_t.
+
+    ``final_norm`` sets the transformer's last norm, which fixes the scale
+    of h at every step: 'affine' (LayerNorm), 'plain' (LayerNorm without
+    scale/shift), 'rms' (RMSNorm without scale, ||h|| = sqrt(D)) or 'none'
+    (h may grow with t). ``weight_norm`` adds a bias-free weight-normalized
+    linear on h (inside the recurrence); ``fix_g`` fixes its g to 1, so each
+    output row is a unit vector. With 'rms' every output coordinate is then
+    sqrt(D) * cos(angle), as in DINO's head up to the sqrt(D) factor.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        emb_dim,
+        depth=2,
+        heads=4,
+        dim_head=64,
+        mlp_dim=512,
+        dropout=0.0,
+        final_norm='affine',
+        weight_norm=False,
+        fix_g=False,
+    ):
+        super().__init__()
+        self.action_proj = nn.Linear(input_dim, emb_dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, emb_dim) * 0.02)
+        self.pos_embedding = nn.Parameter(torch.randn(1, 2, emb_dim) * 0.02)
+        self.transformer = Transformer(
+            emb_dim, emb_dim, emb_dim, depth, heads, dim_head, mlp_dim, dropout
+        )
+        if final_norm == 'plain':
+            self.transformer.norm = nn.LayerNorm(
+                emb_dim, elementwise_affine=False
+            )
+        elif final_norm == 'rms':
+            self.transformer.norm = nn.RMSNorm(
+                emb_dim, elementwise_affine=False
+            )
+        elif final_norm == 'none':
+            self.transformer.norm = nn.Identity()
+        elif final_norm != 'affine':
+            raise ValueError(f'unknown final_norm: {final_norm}')
+        self.out_proj = nn.Identity()
+        if weight_norm:
+            self.out_proj = weight_norm_linear(
+                emb_dim, emb_dim, fix_g, bias=False
+            )
+        elif fix_g:
+            raise ValueError('fix_g requires weight_norm=True')
+
+    def forward(self, x):
+        """
+        x: (B, T, action_dim) -> (B, T, emb_dim), h_1..h_T stacked over
+        time; h_k (B, emb_dim) is the CLS after k steps, the embedding of
+        horizon k (same size for every k)
+        """
+        x = x.to(self.action_proj.weight.dtype)
+        tokens = self.action_proj(x)
+        full = torch.ones(2, 2, dtype=torch.bool, device=x.device)
+        h = self.cls_token.expand(x.size(0), -1, -1)
+        out = []
+        for t in range(x.size(1)):
+            seq = torch.cat([h, tokens[:, t : t + 1]], dim=1)
+            h = self.transformer(seq + self.pos_embedding, attn_mask=full)
+            h = self.out_proj(h[:, :1])
+            out.append(h[:, 0])
+        return torch.stack(out, dim=1)
+
+
 class MLP(nn.Module):
     """Simple MLP with optional normalization and activation
 
