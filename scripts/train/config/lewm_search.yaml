@@ -35,3 +35,28 @@ loss:
     perturb_std: 0.5 # noise std in normalized action units
     var_scale: 1.0 # match solver.var_scale
     temperature: 1.0 # scale on summed goal MSE
+    # cem: CEM elites + perturbed experts are the negatives (settings above).
+    # gfn: a co-trained GFlowNet policy samples them (settings in loss.gfn).
+    sampler: cem
+    batch_size: null # search loss on the first N clips of each batch; null = all
+  gfn:
+    num_samples: 56 # negatives per clip (CEM uses 16 perturbed + 40 elites)
+    explore_std: 1.5 # widen sampling for exploration; TB stays exact
+    # Reward exp(-cost / tau), tau annealed geometrically over anneal_steps
+    # (batches). Goal costs are ~70 for the expert and ~300 for random plans.
+    tau_start: 50.0
+    tau_end: 5.0
+    anneal_steps: ${trainer.max_steps}
+    expert_tb: true # also fit TB on the expert plan (off-policy)
+    wm_every: 2 # policy steps per world-model step
+    optimizer:
+      type: AdamW
+      lr: 3e-4
+      weight_decay: 0.0
+    policy:
+      _target_: stable_worldmodel.wm.lewm.PlanGFlowNet
+      emb_dim: ${embed_dim}
+      action_dim: ${model.action_encoder.input_dim}
+      horizon: ${loss.search.horizon}
+      hidden_dim: 256
+      num_components: 4

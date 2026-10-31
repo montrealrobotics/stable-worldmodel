@@ -1,3 +1,4 @@
+from .gfn_policy import PlanGFlowNet
 from .lewm import LeWM
 from .lewm_oneshot import LeWMOneShotRes
 from .lewm_patch import LeWMPatch, PatchPredictor
@@ -19,5 +20,6 @@ __all__ = [
     'LeWMRes',
     'LeWMState',
     'PatchPredictor',
+    'PlanGFlowNet',
     'ResLeWM',
 ]

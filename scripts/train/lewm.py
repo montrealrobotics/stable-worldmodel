@@ -88,18 +88,29 @@ class SaveCkptCallback(Callback):
     """
 
     def __init__(
-        self, run_name, cfg, epoch_interval: int = 1, step_interval=None
+        self,
+        run_name,
+        cfg,
+        epoch_interval: int = 1,
+        step_interval=None,
+        policy_cfg=None,
     ):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
+        # GFlowNet sampler config; the policy is saved under <run>/gfn_policy.
+        self.policy_cfg = policy_cfg
         self.epoch_interval = epoch_interval
         self.step_interval = step_interval
         self._saved_epoch = None
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, idx):
         super().on_train_batch_end(trainer, pl_module, outputs, batch, idx)
-        step = trainer.global_step
+        # Count batches: with several optimizers global_step counts each one.
+        fit_loop = getattr(trainer, 'fit_loop', None)
+        step = (
+            fit_loop.total_batch_idx + 1 if fit_loop else trainer.global_step
+        )
         if (
             self.step_interval
             and trainer.is_global_zero
@@ -112,12 +123,13 @@ class SaveCkptCallback(Callback):
                 config=self.cfg,
                 filename=f'weights_step_{step}.pt',
             )
+            self._save_policy(pl_module, f'weights_step_{step}.pt')
 
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
         epoch = trainer.current_epoch + 1
         if trainer.is_global_zero and epoch % self.epoch_interval == 0:
-            self._save(pl_module.model, epoch)
+            self._save(pl_module, epoch)
 
     def on_train_end(self, trainer, pl_module):
         super().on_train_end(trainer, pl_module)
@@ -125,27 +137,54 @@ class SaveCkptCallback(Callback):
         # mid-epoch, matching the 1-based names used above.
         epoch = max(trainer.current_epoch, 1)
         if trainer.is_global_zero and self._saved_epoch != epoch:
-            self._save(pl_module.model, epoch)
+            self._save(pl_module, epoch)
 
-    def _save(self, model, epoch):
+    def _save(self, pl_module, epoch):
         self._saved_epoch = epoch
         save_pretrained(
-            model,
+            pl_module.model,
             run_name=self.run_name,
             config=self.cfg,
             filename=f'weights_epoch_{epoch}.pt',
         )
+        self._save_policy(pl_module, f'weights_epoch_{epoch}.pt')
+
+    def _save_policy(self, pl_module, filename):
+        policy = getattr(pl_module, 'gfn_policy', None)
+        if policy is not None:
+            save_pretrained(
+                policy,
+                run_name=f'{self.run_name}/gfn_policy',
+                config=self.policy_cfg,
+                filename=filename,
+            )
 
 
-def search_loss(model, batch, emb, cfg):
-    """InfoNCE over goal costs: the expert plan must beat a short CEM's elites."""
+def search_batch(batch, emb, cfg):
+    """Check the clip length and keep the first ``search.batch_size`` clips."""
+    H, search = cfg.wm.history_size, cfg.loss.search
+    if emb.size(1) < H + search.horizon:
+        raise ValueError(
+            f'search loss needs num_steps >= {H + search.horizon}'
+        )
+    n = search.get('batch_size') or emb.size(0)
+    batch = {
+        k: v[:n] if torch.is_tensor(v) and v.ndim > 0 else v
+        for k, v in batch.items()
+    }
+    return batch, emb[:n]
+
+
+def plan_costs(model, batch, emb, cfg, plans):
+    """Goal MSE of each plan rolled out from the context: (B, S, T, A) -> (B, S).
+
+    The goal is the clip frame ``horizon`` blocks after the last context
+    frame, detached; gradients reach the model through the rollout.
+    """
     H, search = cfg.wm.history_size, cfg.loss.search
     T = search.horizon
-    if emb.size(1) < H + T:
-        raise ValueError(f'search loss needs num_steps >= {H + T}')
     actions = batch['action']
     B = actions.size(0)
-    expert = actions[:, None, H - 1 : H - 1 + T]
     goal = emb[:, H - 1 + T, None].detach()
     skip = ('action', 'emb', 'act_emb')
     heads = max(
@@ -176,12 +215,24 @@ def search_loss(model, batch, emb, cfg):
         info['goal_emb'] = goal
         return GoalMSE()(info)  # (B, S)
 
+    # Attention kernels fail past 65535 rollouts * heads (CUDA grid limit).
+    # shortcut: needs B * heads <= 65535, chunk B too if not.
+    step = max(1, 65535 // (heads * B))
+    chunks = plans.split(step, dim=1)
+    return torch.cat([chunk_cost(c) for c in chunks], dim=1)
+
+
+def search_loss(model, batch, emb, cfg):
+    """InfoNCE over goal costs: the expert plan must beat a short CEM's elites."""
+    H, search = cfg.wm.history_size, cfg.loss.search
+    T = search.horizon
+    batch, emb = search_batch(batch, emb, cfg)
+    actions = batch['action']
+    B = actions.size(0)
+    expert = actions[:, None, H - 1 : H - 1 + T]
+
     def cost(plans):
-        # Attention kernels fail past 65535 rollouts * heads (CUDA grid limit).
-        # shortcut: needs B * heads <= 65535, chunk B too if not.
-        step = max(1, 65535 // (heads * B))
-        chunks = plans.split(step, dim=1)
-        return torch.cat([chunk_cost(c) for c in chunks], dim=1)
+        return plan_costs(model, batch, emb, cfg, plans)
 
     # Mirror CEMSolver: start at N(0, var_scale), refit to the top-k each step.
     mean = torch.zeros_like(expert)
@@ -215,6 +266,59 @@ def search_loss(model, batch, emb, cfg):
     costs = cost(plans)  # expert at index 0
     target = costs.new_zeros(B, dtype=torch.long)
     return F.cross_entropy(-costs.float() / search.temperature, target)
+
+
+def gfn_temperature(gfn, step):
+    """Reward temperature, annealed geometrically from tau_start to tau_end."""
+    t = min(max(step, 0) / max(gfn.anneal_steps, 1), 1.0)
+    return gfn.tau_start * (gfn.tau_end / gfn.tau_start) ** t
+
+
+def gfn_search_loss(model, policy, batch, emb, cfg, step):
+    """InfoNCE with GFlowNet negatives, plus the policy's trajectory balance.
+
+    The policy samples plans in proportion to exp(-cost / tau) under the
+    current world model, so the negatives cover every basin the model scores
+    well. The world model gets only the InfoNCE gradient (samples and
+    conditions are detached); the policy gets only trajectory balance on
+    detached rewards.
+    """
+    H, search, gfn = cfg.wm.history_size, cfg.loss.search, cfg.loss.gfn
+    T = search.horizon
+    batch, emb = search_batch(batch, emb, cfg)
+    expert = batch['action'][:, None, H - 1 : H - 1 + T]
+    z0, z_goal = emb[:, H - 1].detach(), emb[:, H - 1 + T].detach()
+
+    # The policy runs in fp32: TB sums log-probs over all T * A dimensions.
+    fp32 = torch.autocast(z0.device.type, enabled=False)
+    z0, z_goal = z0.float(), z_goal.float()
+    with fp32:
+        samples = policy.sample(
+            z0, z_goal, gfn.num_samples, T, std_scale=gfn.explore_std
+        ).to(expert.dtype)
+    plans = torch.cat([expert, samples], 1)
+    costs = plan_costs(model, batch, emb, cfg, plans)  # expert at index 0
+    target = costs.new_zeros(costs.size(0), dtype=torch.long)
+    infonce = F.cross_entropy(-costs.float() / search.temperature, target)
+
+    tau = gfn_temperature(gfn, step)
+    log_r = -costs.detach().float() / tau
+    if not gfn.expert_tb:  # expert plans are valid off-policy TB samples
+        plans, log_r = samples, log_r[:, 1:]
+    with fp32:
+        log_pi = policy.log_prob(z0, z_goal, plans.float())
+        log_z = policy.log_z(z0, z_goal)[:, None]
+    tb = (log_z + log_pi - log_r).pow(2).mean()
+    return {
+        'search_loss': infonce,
+        'gfn_tb_loss': tb,
+        'gfn_tau': tau,
+        'gfn_log_z': log_z.detach().mean(),
+        'gfn_cost_expert': costs[:, 0].detach().mean(),
+        'gfn_cost_samples': costs[:, 1:].detach().mean(),
+        # > 0: the sampled plans beat the expert under the world model.
+        'gfn_expert_margin': (costs[:, :1] - costs[:, 1:]).detach().mean(),
+    }
 
 
 def normalize_pixels(batch):
@@ -296,13 +400,32 @@ def lejepa_forward(self, batch, stage, cfg):
         output['aux_yaw_loss'] = F.mse_loss(self.aux_head(emb), target)
         output['loss'] = output['loss'] + aux_yaw.weight * output['aux_yaw_loss']
     search = getattr(cfg.loss, 'search', None)
-    if search and search.weight > 0:
+    gfn_logs = {}
+    if search and search.weight > 0 and search.get('sampler', 'cem') == 'gfn':
+        gfn = gfn_search_loss(
+            self.model,
+            self.gfn_policy,
+            batch,
+            emb,
+            cfg,
+            self.trainer.fit_loop.total_batch_idx,  # batches, not opt steps
+        )
+        output['search_loss'] = gfn.pop('search_loss')
+        output['gfn_tb_loss'] = gfn.pop('gfn_tb_loss')
+        gfn_logs = gfn
+        output['loss'] = (
+            output['loss']
+            + search.weight * output['search_loss']
+            + output['gfn_tb_loss']
+        )
+    elif search and search.weight > 0:
         output['search_loss'] = search_loss(self.model, batch, emb, cfg)
         output['loss'] = output['loss'] + search.weight * output['search_loss']
 
     losses_dict = {
         f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k
     }
+    losses_dict.update({f'{stage}/{k}': v for k, v in gfn_logs.items()})
     losses_dict[f'{stage}/sigreg_weight'] = float(lambd)
     if getattr(self.model, 'one_shot', False):
         # scale of the recurrent action state per horizon (drift check)
@@ -455,6 +578,10 @@ def run(cfg):
     extra_modules = {}
     if aux_col:
         extra_modules['aux_head'] = torch.nn.Linear(cfg.embed_dim, 2)
+    search = cfg.loss.get('search') or {}
+    use_gfn = search.get('weight', 0) > 0 and search.get('sampler') == 'gfn'
+    # GFlowNet sampler: the world model steps once per wm_every policy steps.
+    wm_every = cfg.loss.gfn.wm_every if use_gfn else 1
     optimizers = {
         'model_opt': {
             'modules': 'model|aux_head' if aux_col else 'model',
@@ -462,13 +589,26 @@ def run(cfg):
             'scheduler': {
                 'type': 'LinearWarmupCosineAnnealingLR',
                 'warmup_steps': max(
-                    1, int(cfg.get('warmup_ratio', 0.01) * total_steps)
+                    1,
+                    int(cfg.get('warmup_ratio', 0.01) * total_steps)
+                    // wm_every,
                 ),
-                'max_steps': total_steps,
+                'max_steps': max(1, total_steps // wm_every),
             },
             'interval': 'epoch',
+            'frequency': wm_every,
         },
     }
+    if use_gfn:
+        extra_modules['gfn_policy'] = hydra.utils.instantiate(
+            cfg.loss.gfn.policy
+        )
+        optimizers['policy_opt'] = {
+            'modules': 'gfn_policy',
+            'optimizer': dict(cfg.loss.gfn.optimizer),
+            'scheduler': {'type': 'ConstantLR', 'factor': 1.0},
+            'interval': 'epoch',
+        }
 
     data_module = spt.data.DataModule(train=train, val=val)
     world_model = spt.Module(
@@ -505,10 +645,16 @@ def run(cfg):
         step_interval=cfg.get('save_step_interval')
         if cfg.trainer.max_steps > 0
         else None,
+        policy_cfg=cfg.loss.gfn.policy if use_gfn else None,
     )
 
+    trainer_cfg = OmegaConf.to_container(cfg.trainer, resolve=True)
+    if use_gfn and trainer_cfg.get('max_steps', -1) > 0:
+        # max_steps counts batches; Lightning's global_step advances once per
+        # optimizer per batch, whether or not that optimizer stepped.
+        trainer_cfg['max_steps'] = total_steps * len(optimizers)
     trainer = pl.Trainer(
-        **cfg.trainer,
+        **trainer_cfg,
         callbacks=[save_ckpt_callback],
         num_sanity_val_steps=1,
         logger=logger,
