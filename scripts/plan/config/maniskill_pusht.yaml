@@ -31,6 +31,9 @@ dataset:
 
 seed: 42
 policy: ???
+# Clamp CEM candidates to the dataset's action range before scoring, so the
+# world model only scores plans the env executes as planned (it clips actions).
+clip_candidates: false
 cache_dir: null
 subdir: maniskil_pusht_${now:%Y-%m-%d_%H-%M-%S}
 

@@ -20,7 +20,25 @@ from stable_worldmodel.data import ZScoreScaler
 from stable_worldmodel.wm.lewm_gcbc import LeWMGCBC
 
 
-def make_policy(cfg, model, process, transform):
+def candidate_bounds(cfg, dataset, process):
+    """++clip_candidates=true: clamp CEM candidates to the dataset's action
+    range (normalized, tiled over the action block) before scoring, so the
+    world model only scores plans the env would execute as planned."""
+    if not cfg.get('clip_candidates', False):
+        return None
+    raw = np.asarray(dataset.get_col_data('action'), dtype=np.float64)
+    raw = raw[~np.isnan(raw).any(axis=1)]
+    block = cfg.plan_config.action_block
+    return tuple(
+        torch.tensor(
+            np.tile(process['action'].transform(b[None]).reshape(-1), block),
+            dtype=torch.float32,
+        )
+        for b in (raw.min(0), raw.max(0))
+    )
+
+
+def make_policy(cfg, model, process, transform, action_bounds=None):
     """Use native BC execution or CEM, optionally initialized by a BC prior."""
     mode = cfg.get('policy_mode', 'cem')
     if mode not in ('bc', 'cem'):
@@ -53,7 +71,9 @@ def make_policy(cfg, model, process, transform):
             clip_actions=True,
         )
     objective = hydra.utils.instantiate(cfg.objective)
-    cost = swm.planning.ShootingCostEvaluator(model, objective, prior=prior)
+    cost = swm.planning.ShootingCostEvaluator(
+        model, objective, prior=prior, action_bounds=action_bounds
+    )
     solver = hydra.utils.instantiate(cfg.solver, cost=cost)
     return swm.policy.WorldModelPolicy(
         solver=solver,
@@ -231,7 +251,13 @@ def run(cfg: DictConfig):
                 torch.compile(getattr(dynamics, encoder_attr)),
             )
             dynamics.predictor = torch.compile(dynamics.predictor)
-        policy = make_policy(cfg, model, process, transform)
+        policy = make_policy(
+            cfg,
+            model,
+            process,
+            transform,
+            candidate_bounds(cfg, dataset, process),
+        )
 
     else:
         policy = swm.policy.RandomPolicy()

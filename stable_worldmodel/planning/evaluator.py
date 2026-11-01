@@ -135,6 +135,7 @@ class ShootingCostEvaluator(torch.nn.Module):
         encode_goal: Callable[[Dynamics, dict], torch.Tensor]
         | None = default_goal_encode,
         prior: torch.nn.Module | None = None,
+        action_bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -142,6 +143,8 @@ class ShootingCostEvaluator(torch.nn.Module):
         self.constraints = constraints
         self.encode_goal = encode_goal
         self.prior = prior
+        # (low, high) per candidate block dimension; the prior's take over.
+        self.action_bounds = action_bounds
         if prior is not None:
             self.get_action = prior.plan
         if constraints:
@@ -163,6 +166,9 @@ class ShootingCostEvaluator(torch.nn.Module):
             action_candidates.clamp_(
                 self.prior.action_low, self.prior.action_high
             )
+        elif self.action_bounds is not None:
+            low, high = (b.to(action_candidates) for b in self.action_bounds)
+            action_candidates.clamp_(low, high)
         info_dict = self.model.rollout(info_dict, action_candidates)
         info_dict['action_candidates'] = action_candidates
         return info_dict
