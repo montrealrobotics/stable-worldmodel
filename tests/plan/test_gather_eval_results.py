@@ -741,3 +741,61 @@ def test_report_shortens_paths_in_parameters_metrics_and_warnings(
     assert 'assets/object.xml' in shared
     assert 'bad/results.txt: missing' in report
     assert first.config['policy'] == f'{path_root}/model_a/checkpoint.pt'
+
+
+def test_summaries_average_over_checkpoints_horizons_and_goals(tmp_path):
+    evaluations = []
+    for model, offset in (('a', 0), ('b', 40)):
+        for epoch in (5, 10):
+            for horizon in (1, 2):
+                for goal in (10, 20):
+                    directory = tmp_path / f'cube_{model}_ep{epoch}_g{goal}_h{horizon}'
+                    evaluation = parse_result(
+                        result(directory, rate=offset + epoch + horizon * 10 + goal)
+                    )
+                    evaluation.config['policy'] = (
+                        f'models/{model}/weights_epoch_{epoch}.pt'
+                    )
+                    evaluation.config['plan_config']['horizon'] = horizon
+                    evaluation.config['eval'] = {'goal_offset_steps': goal}
+                    evaluations.append(evaluation)
+    output = tmp_path / 'comparison.md'
+    write_report(evaluations, output, tmp_path, 'cube_')
+    report = output.read_text()
+    header = '| Model | Evals | Mean success (%) | h=1 | h=2 | g=10 | g=20 |'
+
+    def table(start, end):
+        section = report[report.index(start) : report.index(end)]
+        assert header in section
+        return [
+            line
+            for line in section.splitlines()
+            if line.startswith('| ') and not line.startswith('| ---')
+        ][1:]
+
+    # Best run first; every column's best value is underlined.
+    assert table('## Run summary', '## Checkpoint summary') == [
+        '| b | 8 | <u>77.5</u> | <u>72.5</u> | <u>82.5</u> | <u>72.5</u> | <u>82.5</u> |',
+        '| a | 8 | 37.5 | 32.5 | 42.5 | 32.5 | 42.5 |',
+    ]
+    assert table('## Checkpoint summary', '## Success grid') == [
+        '| b · epoch 10 | 4 | <u>80.0</u> | <u>75.0</u> | <u>85.0</u> | <u>75.0</u> | <u>85.0</u> |',
+        '| b · epoch 5 | 4 | 75.0 | 70.0 | 80.0 | 70.0 | 80.0 |',
+        '| a · epoch 10 | 4 | 40.0 | 35.0 | 45.0 | 35.0 | 45.0 |',
+        '| a · epoch 5 | 4 | 35.0 | 30.0 | 40.0 | 30.0 | 40.0 |',
+    ]
+    grid = report[report.index('### b') : report.index('### a')]
+    assert '| Checkpoint | Horizon | g=10 | g=20 | mean |' in grid
+    assert '| epoch 5 | 1 | 65.0 | 75.0 | 70.0 |' in grid
+    assert '| **epoch 5** | **mean** | **70.0** | **80.0** | **75.0** |' in grid
+    # Checkpoints in numeric order.
+    assert grid.index('| epoch 5 |') < grid.index('| epoch 10 |')
+    html = output.with_suffix('.html').read_text()
+    data = json.loads(re.search(r'const DATA = (.*);\n', html)[1])
+    assert data['horizons'] == [1, 2] and data['goals'] == [10, 20]
+    assert sorted(len(s['runs']) for s in data['run_summary']) == [8, 8]
+    assert sorted(len(s['runs']) for s in data['summary']) == [4, 4, 4, 4]
+    assert {tuple(r['checkpoint']) for r in data['runs']} == {
+        ('epoch', 5),
+        ('epoch', 10),
+    }

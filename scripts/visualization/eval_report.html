@@ -180,6 +180,22 @@ details > summary { cursor: pointer; font-weight: 600; }
   </aside>
   <main>
     <section class="panel">
+      <h2>Run summary</h2>
+      <p class="note">Evaluations matching the filters (checked or not) grouped by training run (every differing setting except checkpoint, horizon and goal steps). Means over all of a run's checkpoints, horizons and goal steps; h= and g= columns average the success rate (%) over evaluations with that planning horizon or goal offset steps. The best value per column is underlined.</p>
+      <div class="table-wrap" id="run-summary"></div>
+    </section>
+    <section class="panel">
+      <h2>Checkpoint summary</h2>
+      <p class="note">The same means per checkpoint, over horizons and goal steps.</p>
+      <div class="table-wrap" id="summary"></div>
+    </section>
+    <section class="panel">
+      <h2>Success grid</h2>
+      <p class="note">Success rate (%) per checkpoint, planning horizon and goal offset steps for each training run, over all evaluations matching the filters. <b>mean</b> rows average over horizons, the mean column over goal steps. Darker cells are higher.</p>
+      <div class="controls"><label for="grid-run">Run</label><select id="grid-run"></select></div>
+      <div class="table-wrap" id="grid"></div>
+    </section>
+    <section class="panel">
       <h2>Success rate and mean errors</h2>
       <p class="note">One line per model; runs named &lt;model&gt;_ep&lt;N&gt; are plotted by epoch. Lower error is better.</p>
       <div class="legend" id="overview-legend"></div>
@@ -433,6 +449,77 @@ function renderOverview() {
       yaxis: {rangemode: 'tozero'}, height: 280,
     }), config);
   }
+}
+
+// ---------- model summary ----------
+const mean = (values) => {
+  values = values.filter((v) => v != null && Number.isFinite(v));
+  return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
+};
+// Summaries average every evaluation the filters match, not only the
+// checked runs: large reports check just the top runs by default.
+function summaryGroups(groups) {
+  const vis = new Set(runs.filter(matchesFilter).map((r) => r.id));
+  return groups.map((s) => ({label: s.label, runs: runs.filter((r) => s.runs.includes(r.id) && vis.has(r.id))}))
+    .filter((g) => g.runs.length);
+}
+function renderSummaryTable(id, groups) {
+  const cols = [
+    {label: 'Mean success (%)', best: 'max', get: (rs) => mean(rs.map((r) => r.success_rate))},
+    ...metrics.map(([k, label]) => ({label: `Mean ${label}`, best: 'min', error: true,
+      get: (rs) => mean(rs.map((r) => r.means[k]))})),
+    ...DATA.horizons.map((h) => ({label: `h=${h}`, best: 'max',
+      get: (rs) => mean(rs.filter((r) => r.horizon === h).map((r) => r.success_rate))})),
+    ...DATA.goals.map((g) => ({label: `g=${g}`, best: 'max',
+      get: (rs) => mean(rs.filter((r) => r.goal === g).map((r) => r.success_rate))})),
+  ];
+  const rows = summaryGroups(groups).map((g) => ({label: g.label, count: g.runs.length, values: cols.map((c) => c.get(g.runs))}))
+    .sort((a, b) => (b.values[0] ?? -Infinity) - (a.values[0] ?? -Infinity));
+  if (!rows.length) { $(id).innerHTML = '<p class="empty">No runs selected.</p>'; return; }
+  const best = cols.map((c, i) => {
+    const vals = rows.map((row) => row.values[i]).filter((v) => v != null);
+    return rows.length > 1 && vals.length ? Math[c.best](...vals) : null;
+  });
+  $(id).innerHTML = `<table><thead><tr><th>Model</th><th>Evals</th>${cols.map((c) =>
+    `<th>${esc(c.label)}</th>`).join('')}</tr></thead><tbody>${rows.map((row) =>
+    `<tr><td>${esc(row.label)}</td><td class="num">${row.count}</td>${row.values.map((v, i) =>
+      `<td class="num${v != null && v === best[i] ? ' best' : ''}">${
+        v == null ? '—' : cols[i].error ? fmt(v) : v.toFixed(1)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+}
+// Success rate per checkpoint x horizon x goal steps for one run.
+function renderGrid() {
+  const groups = summaryGroups(DATA.run_summary)
+    .map((g) => ({...g, score: mean(g.runs.map((r) => r.success_rate))}))
+    .sort((a, b) => b.score - a.score);
+  const pick = $('grid-run');
+  const current = pick.value;
+  pick.innerHTML = groups.map((g) => `<option>${esc(g.label)}</option>`).join('');
+  if (groups.some((g) => g.label === current)) pick.value = current;
+  const group = groups.find((g) => g.label === pick.value);
+  if (!group) { $('grid').innerHTML = '<p class="empty">No runs selected.</p>'; return; }
+  const ckKey = (r) => r.checkpoint ? r.checkpoint.join(' ') : '—';
+  const ckpts = [...new Map(group.runs.map((r) => [ckKey(r), r.checkpoint])).entries()]
+    .sort((a, b) => (a[1]?.[0] ?? '').localeCompare(b[1]?.[0] ?? '') || (a[1]?.[1] ?? 0) - (b[1]?.[1] ?? 0))
+    .map(([key]) => key);
+  const rate = (ck, h, g) => mean(group.runs.filter((r) => ckKey(r) === ck &&
+    (h === undefined || r.horizon === h) && (g === undefined || r.goal === g)).map((r) => r.success_rate));
+  const td = (v, strong) => {
+    const shade = v == null ? '' : ` style="background:color-mix(in srgb, var(--accent, #2a6fdb) ${Math.round(v * 0.6)}%, transparent)"`;
+    const text = v == null ? '—' : v.toFixed(1);
+    return `<td class="num"${shade}>${strong ? `<b>${text}</b>` : text}</td>`;
+  };
+  $('grid').innerHTML = `<table><thead><tr><th>Checkpoint</th><th>Horizon</th>${DATA.goals.map((g) =>
+    `<th>g=${esc(g)}</th>`).join('')}<th>mean</th></tr></thead><tbody>${ckpts.map((ck) =>
+    DATA.horizons.map((h) => `<tr><td>${esc(ck)}</td><td class="num">${esc(h)}</td>${
+      DATA.goals.map((g) => td(rate(ck, h, g))).join('')}${td(rate(ck, h))}</tr>`).join('') +
+    `<tr><td><b>${esc(ck)}</b></td><td class="num"><b>mean</b></td>${
+      DATA.goals.map((g) => td(rate(ck, undefined, g), true)).join('')}${td(rate(ck), true)}</tr>`).join('')}</tbody></table>`;
+}
+$('grid-run').addEventListener('change', renderGrid);
+function renderSummary() {
+  renderSummaryTable('run-summary', DATA.run_summary);
+  renderSummaryTable('summary', DATA.summary);
+  renderGrid();
 }
 
 // ---------- runs table ----------
@@ -719,6 +806,7 @@ function update() {
   rankColors();
   renderFacets();
   renderSidebar();
+  renderSummary();
   renderOverview();
   renderTable();
   renderEpisodes();

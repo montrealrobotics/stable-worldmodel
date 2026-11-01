@@ -591,7 +591,7 @@ def important_parameter(key: str) -> bool:
                 'wm.',
             )
         )
-        and key not in {'world.expert_output_dir'}
+        and key not in {'world.expert_output_dir', 'world.expert_cache_dir'}
     )
 
 
@@ -1163,6 +1163,239 @@ def mean_error_lines(
     ]
 
 
+def sort_values(values) -> list:
+    """Numbers in numeric order, then any other values as text."""
+    return sorted(
+        set(values),
+        key=lambda v: (0, v) if isinstance(v, (int, float)) else (1, str(v)),
+    )
+
+
+CHECKPOINT_FACETS = ('epoch', 'step')
+
+
+def summary_facets(
+    configs: list[dict[str, Any]], differing: list[str]
+) -> list[dict[str, str]]:
+    """Facets of every differing setting except horizon and goal steps."""
+    split = [key for key in differing if key not in FACET_NAMES]
+    return [
+        run_facets({key: plain(c.get(key, '—')) for key in split})
+        for c in configs
+    ]
+
+
+def checkpoint_of(facet: dict[str, str]) -> tuple[str, int] | None:
+    """The (epoch|step, number) of an evaluation's checkpoint, if known."""
+    for name in CHECKPOINT_FACETS:
+        if name in facet:
+            return name, int(facet[name])
+    return None
+
+
+def model_summary(
+    configs: list[dict[str, Any]],
+    differing: list[str],
+    merge_checkpoints: bool = False,
+) -> list[tuple[str, list[int]]]:
+    """Group evaluations by every differing setting except horizon and goal
+    steps, so each group is one model checkpoint swept over those two; with
+    merge_checkpoints, one group per training run over all its checkpoints."""
+    facets = summary_facets(configs, differing)
+    skip = CHECKPOINT_FACETS if merge_checkpoints else ()
+    names = [
+        name
+        for name in dict.fromkeys(n for f in facets for n in f)
+        if name not in skip and len({f.get(name) for f in facets}) > 1
+    ]
+    groups: dict[tuple, list[int]] = {}
+    for index, facet in enumerate(facets):
+        groups.setdefault(tuple(facet.get(n) for n in names), []).append(index)
+    summary = []
+    for key, indices in groups.items():
+        label = ' · '.join(
+            value if name == 'model' else f'{name} {value}'
+            for name, value in zip(names, key)
+            if value is not None
+        )
+        summary.append((label or 'all runs', indices))
+    return summary
+
+
+def finite_mean(values) -> float:
+    values = [v for v in values if math.isfinite(v)]
+    return sum(values) / len(values) if values else math.nan
+
+
+def summary_lines(
+    evaluations: list[Evaluation],
+    configs: list[dict[str, Any]],
+    groups: list[tuple[str, list[int]]],
+    mean_keys: list[str],
+    title: str,
+    note: str,
+) -> list[str]:
+    """Markdown table of per-group means over all evaluations, horizons and
+    goal steps, best group first."""
+    horizon_key, goal_key = FACET_NAMES
+    horizons = sort_values(c[horizon_key] for c in configs if horizon_key in c)
+    goals = sort_values(c[goal_key] for c in configs if goal_key in c)
+    mean = finite_mean
+
+    rows = []
+    for label, indices in groups:
+        rates = [(configs[i], evaluations[i].success_rate) for i in indices]
+        rows.append(
+            [
+                label,
+                len(indices),
+                mean(rate for _, rate in rates),
+                *(
+                    mean(
+                        evaluations[i].mean_errors.get(key, math.nan)
+                        for i in indices
+                    )
+                    for key in mean_keys
+                ),
+                *(
+                    mean(r for c, r in rates if c.get(horizon_key) == h)
+                    for h in horizons
+                ),
+                *(mean(r for c, r in rates if c.get(goal_key) == g) for g in goals),
+            ]
+        )
+    rows.sort(key=lambda row: -row[2] if math.isfinite(row[2]) else math.inf)
+    # Highest success rate and lowest error per column.
+    columns = list(zip(*rows))[2:] if rows else []
+    best = [
+        (min if 3 <= index < 3 + len(mean_keys) else max)(
+            (v for v in column if math.isfinite(v)), default=None
+        )
+        if len(rows) > 1
+        else None
+        for index, column in enumerate(columns, 2)
+    ]
+
+    def number(value: float, best_value: float | None, digits: str) -> str:
+        if not math.isfinite(value):
+            return '—'
+        text = format(value, digits)
+        return f'<u>{text}</u>' if value == best_value else text
+
+    headers = [
+        'Model',
+        'Evals',
+        'Mean success (%)',
+        *(f'Mean {ERROR_METRICS[key]}' for key in mean_keys),
+        *(f'h={cell(h)}' for h in horizons),
+        *(f'g={cell(g)}' for g in goals),
+    ]
+    lines = [
+        f'## {title}',
+        '',
+        note,
+        '',
+        '| ' + ' | '.join(headers) + ' |',
+        '| --- | ' + ' | '.join(['---:'] * (len(headers) - 1)) + ' |',
+    ]
+    for label, count, *values in rows:
+        lines.append(
+            '| '
+            + ' | '.join(
+                [
+                    cell(label),
+                    str(count),
+                    *(
+                        number(
+                            value,
+                            best_value,
+                            '.4g' if 1 <= index <= len(mean_keys) else '.1f',
+                        )
+                        for index, (value, best_value) in enumerate(
+                            zip(values, best)
+                        )
+                    ),
+                ]
+            )
+            + ' |'
+        )
+    lines.append('')
+    return lines
+
+
+def grid_lines(
+    evaluations: list[Evaluation],
+    configs: list[dict[str, Any]],
+    runs: list[tuple[str, list[int]]],
+    checkpoints: list[tuple[str, int] | None],
+) -> list[str]:
+    """Per training run, success rate (%) for every checkpoint × horizon
+    (rows) × goal steps (columns), with means over each axis."""
+    horizon_key, goal_key = FACET_NAMES
+    goals = sort_values(c[goal_key] for c in configs if goal_key in c)
+    horizons = sort_values(c[horizon_key] for c in configs if horizon_key in c)
+    if len(goals) < 2 and len(horizons) < 2:
+        return []
+
+    def number(value: float) -> str:
+        return format(value, '.1f') if math.isfinite(value) else '—'
+
+    lines = [
+        '## Success grid',
+        '',
+        (
+            'Success rate (%) per checkpoint, planning horizon and goal offset '
+            'steps for each training run. **mean** rows average over '
+            'horizons, the mean column over goal steps.'
+        ),
+        '',
+    ]
+    for label, indices in sorted(
+        runs,
+        key=lambda run: -finite_mean(
+            evaluations[i].success_rate for i in run[1]
+        ),
+    ):
+        ckpts = sorted(
+            {checkpoints[i] for i in indices if checkpoints[i] is not None}
+        ) or [None]
+
+        def rate(ckpt, horizon=None, goal=None) -> float:
+            return finite_mean(
+                evaluations[i].success_rate
+                for i in indices
+                if checkpoints[i] == ckpt
+                and horizon in (None, configs[i].get(horizon_key))
+                and goal in (None, configs[i].get(goal_key))
+            )
+
+        lines.extend(
+            [
+                f'### {cell(label)}',
+                '',
+                '| Checkpoint | Horizon | '
+                + ' | '.join(f'g={cell(g)}' for g in goals)
+                + ' | mean |',
+                '| --- | ---: | ' + ' | '.join(['---:'] * (len(goals) + 1)) + ' |',
+            ]
+        )
+        for ckpt in ckpts:
+            name = f'{ckpt[0]} {ckpt[1]}' if ckpt else '—'
+            for horizon in horizons:
+                lines.append(
+                    f'| {name} | {cell(horizon)} | '
+                    + ' | '.join(number(rate(ckpt, horizon, g)) for g in goals)
+                    + f' | {number(rate(ckpt, horizon))} |'
+                )
+            lines.append(
+                f'| **{name}** | **mean** | '
+                + ' | '.join(f'**{number(rate(ckpt, goal=g))}**' for g in goals)
+                + f' | **{number(rate(ckpt))}** |'
+            )
+        lines.append('')
+    return lines
+
+
 def write_report(
     evaluations: list[Evaluation],
     output: Path,
@@ -1229,6 +1462,8 @@ def write_report(
         text = f'{value:.6g}'
         return f'<u>{text}</u>' if value == best_errors[key] else text
 
+    run_groups = model_summary(configs, differing, merge_checkpoints=True)
+    model_groups = model_summary(configs, differing)
     headers = [
         'Evaluation',
         'Success rate (%)',
@@ -1251,6 +1486,38 @@ def write_report(
         ),
         '',
         f'[Shared parameters]({relative_url(shared_path, output)})',
+        '',
+        *summary_lines(
+            evaluations,
+            configs,
+            run_groups,
+            mean_keys,
+            'Run summary',
+            (
+                'Means over each training run\'s evaluations: all '
+                'checkpoints, horizons and goal steps. h= and g= columns '
+                'average the success rate (%) over evaluations with that '
+                'planning horizon or goal offset steps. The best value per '
+                'column is underlined.'
+            ),
+        ),
+        *summary_lines(
+            evaluations,
+            configs,
+            model_groups,
+            mean_keys,
+            'Checkpoint summary',
+            (
+                'The same means per checkpoint, over horizons and goal steps.'
+            ),
+        ),
+        *grid_lines(
+            evaluations,
+            configs,
+            run_groups,
+            [checkpoint_of(f) for f in summary_facets(configs, differing)],
+        ),
+        '## Runs',
         '',
         (
             'Only differing model, planning, and evaluation settings are shown '
@@ -1346,8 +1613,16 @@ def write_report(
             f'- {cell(portable_text(warning))}' for warning in warnings
         )
     output.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    horizon_key, goal_key = FACET_NAMES
     runs = []
-    for index, (evaluation, config) in enumerate(zip(evaluations, configs), 1):
+    for index, (evaluation, config, checkpoint) in enumerate(
+        zip(
+            evaluations,
+            configs,
+            map(checkpoint_of, summary_facets(configs, differing)),
+        ),
+        1,
+    ):
         directory = evaluation.source.parent
         group, epoch = run_group(directory, root)
         runs.append(
@@ -1366,6 +1641,9 @@ def write_report(
                 'params': {
                     key: plain(config.get(key, '—')) for key in differing
                 },
+                'horizon': config.get(horizon_key),
+                'goal': config.get(goal_key),
+                'checkpoint': checkpoint,
             }
         )
     for run in runs:
@@ -1381,6 +1659,18 @@ def write_report(
         'metrics': ERROR_METRICS,
         'runs': runs,
         'differing': differing,
+        'summary': [
+            {'label': label, 'runs': [i + 1 for i in indices]}
+            for label, indices in model_groups
+        ],
+        'run_summary': [
+            {'label': label, 'runs': [i + 1 for i in indices]}
+            for label, indices in run_groups
+        ],
+        'horizons': sort_values(
+            c[horizon_key] for c in configs if horizon_key in c
+        ),
+        'goals': sort_values(c[goal_key] for c in configs if goal_key in c),
         'shared': {key: plain(value) for key, value in shared.items()},
         'episodes': [
             {
