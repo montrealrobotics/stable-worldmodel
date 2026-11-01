@@ -5,6 +5,7 @@ from pathlib import Path
 
 import hydra
 import lightning as pl
+import numpy as np
 import stable_pretraining as spt
 import torch
 import torch._functorch.config
@@ -222,6 +223,16 @@ def plan_costs(model, batch, emb, cfg, plans):
     return torch.cat([chunk_cost(c) for c in chunks], dim=1)
 
 
+def clip_plans(plans, cfg):
+    """Clamp plans to the dataset action range when ``clip_actions`` is on."""
+    search = cfg.loss.search
+    if not search.get('clip_actions'):
+        return plans
+    low = plans.new_tensor(list(search.action_low))
+    high = plans.new_tensor(list(search.action_high))
+    return torch.maximum(torch.minimum(plans, high), low)
+
+
 def search_loss(model, batch, emb, cfg):
     """InfoNCE over goal costs: the expert plan must beat a short CEM's elites."""
     H, search = cfg.wm.history_size, cfg.loss.search
@@ -249,6 +260,7 @@ def search_loss(model, batch, emb, cfg):
                 dtype=actions.dtype,
             )
             plans[:, 0] = mean[:, 0]
+            plans = clip_plans(plans, cfg)
             idx = cost(plans).topk(search.topk, dim=1, largest=False).indices
             top = plans[rows, idx]
             elites.append(top)
@@ -262,7 +274,7 @@ def search_loss(model, batch, emb, cfg):
         device=actions.device,
         dtype=actions.dtype,
     )
-    plans = torch.cat([expert, perturbed, *elites], 1)
+    plans = torch.cat([expert, clip_plans(perturbed, cfg), *elites], 1)
     costs = cost(plans)  # expert at index 0
     target = costs.new_zeros(B, dtype=torch.long)
     return F.cross_entropy(-costs.float() / search.temperature, target)
@@ -272,6 +284,33 @@ def gfn_temperature(gfn, step):
     """Reward temperature, annealed geometrically from tau_start to tau_end."""
     t = min(max(step, 0) / max(gfn.anneal_steps, 1), 1.0)
     return gfn.tau_start * (gfn.tau_end / gfn.tau_start) ** t
+
+
+def gfn_log_reward(costs, plans, gfn, tau):
+    """log R = -cost / tau, plus a N(0, prior_std^2 I) prior over the plan.
+
+    Without the prior R / Z is not normalizable: far from the data the cost
+    flattens out, so the target spreads over unbounded action space.
+    With ``expert_threshold``, cost counts only above the expert's own cost
+    (column 0) plus ``threshold_margin``: every plan the world model scores
+    at least as well as the expert gets the same reward up to the prior, so
+    the policy samples those violations evenly.
+    With ``relative_cost``, costs are first divided by the expert's, so tau
+    keeps its meaning while the world model rescales its costs (the cost
+    ratio of samples to expert stays stable when both inflate).
+    costs: (B, S), expert first; plans: (B, S, T, A), normalized actions.
+    """
+    cost = costs.float()
+    if gfn.get('relative_cost'):
+        cost = cost / cost[:, :1].clamp(min=1e-6)
+    if gfn.get('expert_threshold'):
+        margin = gfn.get('threshold_margin', 0.0)
+        cost = (cost - cost[:, :1] - margin).clamp(min=0)
+    log_r = -cost / tau
+    if gfn.get('prior_std'):
+        sq = plans.float().pow(2).sum((-1, -2))
+        log_r = log_r - sq / (2 * gfn.prior_std**2)
+    return log_r
 
 
 def gfn_search_loss(model, policy, batch, emb, cfg, step):
@@ -302,7 +341,7 @@ def gfn_search_loss(model, policy, batch, emb, cfg, step):
     infonce = F.cross_entropy(-costs.float() / search.temperature, target)
 
     tau = gfn_temperature(gfn, step)
-    log_r = -costs.detach().float() / tau
+    log_r = gfn_log_reward(costs.detach(), plans, gfn, tau)
     if not gfn.expert_tb:  # expert plans are valid off-policy TB samples
         plans, log_r = samples, log_r[:, 1:]
     with fp32:
@@ -316,6 +355,9 @@ def gfn_search_loss(model, policy, batch, emb, cfg, step):
         'gfn_log_z': log_z.detach().mean(),
         'gfn_cost_expert': costs[:, 0].detach().mean(),
         'gfn_cost_samples': costs[:, 1:].detach().mean(),
+        'gfn_action_rms': samples.float().pow(2).mean().sqrt(),
+        # Share of samples the world model scores better than the expert.
+        'gfn_violation_frac': (costs[:, 1:] < costs[:, :1]).float().mean(),
         # > 0: the sampled plans beat the expert under the world model.
         'gfn_expert_margin': (costs[:, :1] - costs[:, 1:]).detach().mean(),
     }
@@ -514,6 +556,8 @@ def run(cfg):
 
             normalizer = get_column_normalizer(dataset, col, col)
             transforms.append(normalizer)
+            if col == 'action':
+                action_scaler = normalizer.lambd  # the fitted scaler
 
         cfg.model.action_encoder.input_dim = (
             cfg.data.dataset.frameskip * dataset.get_dim('action')
@@ -525,6 +569,20 @@ def run(cfg):
 
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
+
+    # Keep search-loss plans inside the dataset's action range (normalized,
+    # tiled over the frameskip block): the world model never saw actions
+    # outside it, and the env clips them anyway.
+    if (cfg.loss.get('search') or {}).get('clip_actions'):
+        raw = np.asarray(dataset.get_col_data('action'), dtype=np.float64)
+        raw = raw[~np.isnan(raw).any(axis=1)]
+        block = cfg.data.dataset.frameskip
+        with open_dict(cfg):
+            for name, bound in (('low', raw.min(0)), ('high', raw.max(0))):
+                norm = action_scaler.transform(bound[None]).reshape(-1)
+                cfg.loss.search[f'action_{name}'] = np.tile(
+                    norm, block
+                ).tolist()
 
     # Noisy-replay ratio sweeps: subset after fitting normalizers on all data.
     replay_filter = cfg.get('replay_filter')

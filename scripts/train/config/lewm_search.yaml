@@ -39,6 +39,9 @@ loss:
     # gfn: a co-trained GFlowNet policy samples them (settings in loss.gfn).
     sampler: cem
     batch_size: null # search loss on the first N clips of each batch; null = all
+    # Clamp CEM/perturbed plans to the dataset's normalized action range (the
+    # env clips raw actions to it anyway). GFlowNet samples are not clamped.
+    clip_actions: false
   gfn:
     num_samples: 56 # negatives per clip (CEM uses 16 perturbed + 40 elites)
     explore_std: 1.5 # widen sampling for exploration; TB stays exact
@@ -47,8 +50,20 @@ loss:
     tau_start: 50.0
     tau_end: 5.0
     anneal_steps: ${trainer.max_steps}
+    # Gaussian prior N(0, prior_std^2 I) on the plan in the reward; keeps the
+    # target normalizable (normalized actions have unit std). null: no prior.
+    prior_std: 1.0
+    # Reward only cost above the expert's cost + margin, so the policy samples
+    # plans the world model wrongly scores as good as the expert, evenly.
+    expert_threshold: false
+    threshold_margin: 0.0
+    # Divide costs by the expert's, making tau scale-free (use tau ~1 -> 0.1;
+    # random plans cost ~5x the expert).
+    relative_cost: false
     expert_tb: true # also fit TB on the expert plan (off-policy)
-    wm_every: 2 # policy steps per world-model step
+    # Policy steps per world-model step; the world model accumulates this many
+    # batches per update, so 10k batches give 10k / wm_every updates.
+    wm_every: 16
     optimizer:
       type: AdamW
       lr: 3e-4

@@ -113,3 +113,84 @@ def test_gfn_search_loss_splits_gradients(lewm_script):
     out['gfn_tb_loss'].backward()
     assert policy.head.weight.grad.abs().sum() > 0
     assert all(p.grad is None for p in model.parameters())
+
+
+def test_evaluator_clamps_candidates_to_action_bounds():
+    from stable_worldmodel.planning.evaluator import ShootingCostEvaluator
+
+    class _Model:
+        def rollout(self, info, candidates):
+            info['seen'] = candidates.clone()
+            return info
+
+    bounds = (torch.tensor([-1.0, -2.0]), torch.tensor([1.0, 2.0]))
+    evaluator = ShootingCostEvaluator(
+        _Model(), objective=None, encode_goal=None, action_bounds=bounds
+    )
+    candidates = torch.tensor([[[[5.0, -5.0], [0.5, 0.5]]]])
+    info = evaluator._rollout({}, candidates)
+    assert info['seen'].tolist() == [[[[1.0, -2.0], [0.5, 0.5]]]]
+
+
+def test_gaussian_prior_keeps_flat_reward_normalizable(lewm_script):
+    """Flat cost (as far from the data): with the prior TB fits N(0, 1);
+    without it the widened exploration samples make the policy keep spreading.
+    """
+    log_reward = lewm_script.gfn_log_reward
+    plans = torch.full((1, 1, 2, 3), 2.0)
+    costs = torch.tensor([[10.0]])
+    gfn = OmegaConf.create({'prior_std': 2.0})
+    # -10 / 5 - (6 * 2^2) / (2 * 2^2)
+    assert log_reward(costs, plans, gfn, tau=5.0).item() == pytest.approx(-5)
+    no_prior = OmegaConf.create({'prior_std': None})
+    assert log_reward(costs, plans, no_prior, 5.0).item() == pytest.approx(-2)
+
+    def fitted_std(prior_std):
+        torch.manual_seed(0)
+        policy = PlanGFlowNet(
+            emb_dim=2, action_dim=2, horizon=2, hidden_dim=32
+        )
+        opt = torch.optim.Adam(policy.parameters(), lr=1e-2)
+        z = torch.zeros(16, 2)
+        gfn = OmegaConf.create({'prior_std': prior_std})
+        for _ in range(300):
+            plans = policy.sample(z, z, n=8, std_scale=1.5)
+            log_r = log_reward(torch.zeros(16, 8), plans, gfn, tau=1.0)
+            log_z = policy.log_z(z, z)[:, None]
+            tb = (log_z + policy.log_prob(z, z, plans) - log_r).pow(2)
+            opt.zero_grad()
+            tb.mean().backward()
+            opt.step()
+        return policy.sample(z, z, n=64).std().item()
+
+    assert fitted_std(1.0) == pytest.approx(1.0, abs=0.25)
+    assert fitted_std(None) > 3.0
+
+
+def test_expert_threshold_flattens_reward_below_expert(lewm_script):
+    log_reward = lewm_script.gfn_log_reward
+    costs = torch.tensor([[50.0, 40.0, 55.0, 80.0]])  # expert first
+    plans = torch.zeros(1, 4, 2, 3)
+    gfn = OmegaConf.create(
+        {'prior_std': None, 'expert_threshold': True, 'threshold_margin': 10}
+    )
+    # Cost counts only above 50 + 10: the first three tie, 80 pays 20 / tau.
+    assert log_reward(costs, plans, gfn, tau=5.0).tolist() == [
+        [0.0, 0.0, 0.0, -4.0]
+    ]
+    gfn.expert_threshold = False
+    assert log_reward(costs, plans, gfn, tau=5.0)[0, 1].item() == -8.0
+
+
+def test_relative_cost_is_scale_free(lewm_script):
+    log_reward = lewm_script.gfn_log_reward
+    plans = torch.zeros(1, 3, 2, 3)
+    gfn = OmegaConf.create(
+        {'prior_std': None, 'relative_cost': True, 'expert_threshold': True}
+    )
+    costs = torch.tensor([[50.0, 40.0, 150.0]])  # expert first
+    # Ratios 1, 0.8, 3: only the excess over 1 counts, divided by tau.
+    expected = [[0.0, 0.0, -4.0]]
+    assert log_reward(costs, plans, gfn, tau=0.5).tolist() == expected
+    # Inflating every cost leaves the reward unchanged.
+    assert log_reward(3 * costs, plans, gfn, tau=0.5).tolist() == expected
