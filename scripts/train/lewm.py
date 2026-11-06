@@ -61,6 +61,23 @@ def get_img_preprocessor(
     return dt.transforms.Compose(to_image, resize)
 
 
+class OfflineWandbManager(spt.Manager):
+    """spt reloads an offline run's config from its previous offline run and
+    crashes when there is none (a fresh run on a cluster without internet).
+    The config is already logged by ``log_hyperparams``, so skip the reload."""
+
+    def init_and_sync_wandb(self):
+        import wandb
+
+        if (
+            wandb.run is not None
+            and wandb.run.offline
+            and self._wandb_previous_dir() is None
+        ):
+            return
+        super().init_and_sync_wandb()
+
+
 class SaveCkptCallback(Callback):
     """Save the model with save_pretrained every ``epoch_interval`` epochs.
 
@@ -496,7 +513,7 @@ def run(cfg):
     )
     if configured_ckpt_path and not ckpt_path.is_file():
         raise FileNotFoundError(f'Checkpoint does not exist: {ckpt_path}')
-    manager = spt.Manager(
+    manager = OfflineWandbManager(
         trainer=trainer,
         module=world_model,
         data=data_module,
