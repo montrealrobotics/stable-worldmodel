@@ -205,6 +205,8 @@ node_modules/
 
 # custom
 logs/
+# cluv's symlink to results_path
+/logs
 .claude/
 .vscode/
 *.sh
@@ -212,6 +214,8 @@ logs/
 **/__pycache__/**
 **/*.pyc
 !scripts/minerl.sh
+!scripts/job.sh
+!scripts/safe_job.sh
 
 outputs/
 multirun/

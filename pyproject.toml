@@ -125,3 +125,89 @@ quote-style = "single"
 
 [tool.coverage.run]
 omit = ["stable_worldmodel/envs/*"]
+
+[tool.cluv]
+# All variables below can be overridden per cluster (except data_source).
+
+# Job script to use by default when one isn't passed to the `submit` command, on all clusters.
+# Can also be overridden per job submission.
+job_script_path = "scripts/job.sh"
+
+# Where to store job results by default.
+results_path = "$SCRATCH/logs/stable-worldmodel"
+
+# On clusters, Cluv creates a symlink (a shortcut) in your project folder to the results_path dir.
+# This makes it easier to keep your project in $HOME and to see the results which are on $SCRATCH.
+results_symlink = "logs"
+
+## The path where the project should be replicated on remote clusters.
+project_dir = "$HOME/git/stable-worldmodel"
+
+## Where to read the data from when synchronizing data to all clusters.
+data_source = "mila:/network/scratch/o/ozgur.aslan/le-wm/cluv_data"
+
+## Where the dataset should be replicated on all clusters.
+datasets_path = "$SCRATCH/le-wm/cluv_data"
+
+[tool.cluv.env]
+# Environment variables applied when using Slurm commands on all clusters.
+# Assume that compute nodes don't have internet access by default. Override below when they do.
+UV_OFFLINE = "1"
+WANDB_MODE = "offline"
+
+[tool.cluv.local]
+# Settings (environment variables) applied when using cluv on a local machine (not on a Slurm cluster).
+# Fake "$SCRATCH" directory to use when not on a Slurm cluster.
+# This makes the examples runnable either from a laptop or from a Slurm cluster.
+env = { SCRATCH = "$HOME/scratch" }
+
+[tool.cluv.sbatch_args]
+# sbatch flags applied on all clusters. CLI-supplied flags take precedence.
+requeue = true
+
+###  --------------   Clusters Config   --------------  ###
+
+[tool.cluv.clusters.mila]
+# Overrides specific to the Mila cluster.
+env = { UV_OFFLINE = "0", WANDB_MODE = "online" }
+
+[tool.cluv.clusters.tamia]
+sbatch_args = { account = "aip-gberseth" }
+
+[tool.cluv.clusters.killarney]
+# Killarney refuses to run jobs whose submission directory is under /home
+# ("Submitting jobs from directories residing in /home is not permitted"), so the project lives on
+# $SCRATCH there instead of the default $HOME location.
+project_dir = "$SCRATCH/git/stable-worldmodel"
+sbatch_args = { account = "aip-gberseth" }
+
+[tool.cluv.clusters.vulcan]
+sbatch_args = { account = "aip-gberseth" }
+
+[tool.cluv.clusters.rorqual]
+# With more than one allocation on a cluster, `cluv submit rorqual` submits one job per allocation
+# and keeps the first one that starts, cancelling the others.
+sbatch_args = [{ account = "rrg-gberseth" }, { account = "def-gberseth" }]
+
+[tool.cluv.clusters.fir]
+env = { UV_OFFLINE = "0", WANDB_MODE = "online" }
+sbatch_args = [{ account = "rrg-gberseth" }, { account = "def-gberseth" }]
+
+[tool.cluv.clusters.nibi]
+env = { UV_OFFLINE = "0", WANDB_MODE = "online" }
+# No rrg allocation on Nibi.
+sbatch_args = { account = "def-gberseth" }
+
+[tool.cluv.clusters.trillium]
+sbatch_args = [{ account = "rrg-gberseth" }, { account = "def-gberseth" }]
+# $HOME isn't mounted on Trillium's compute nodes, so a job submitted from the default $HOME
+# location is rejected ("Job output requested to be written to a filesystem not available on
+# compute nodes"). Keep the project on $SCRATCH instead.
+project_dir = "$SCRATCH/git/stable-worldmodel"
+
+[tool.cluv.clusters.trillium-gpu]
+sbatch_args = [{ account = "rrg-gberseth" }, { account = "def-gberseth" }]
+project_dir = "$SCRATCH/git/stable-worldmodel"
+
+[tool.cluv.clusters.narval]
+sbatch_args = [{ account = "rrg-gberseth" }, { account = "def-gberseth" }]
