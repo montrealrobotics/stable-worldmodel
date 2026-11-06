@@ -144,10 +144,13 @@ results_symlink = "logs"
 project_dir = "$HOME/git/stable-worldmodel"
 
 ## Where to read the data from when synchronizing data to all clusters.
-data_source = "mila:/network/scratch/o/ozgur.aslan/le-wm/cluv_data"
+# Unset: a laptop-run sync would download the data locally first. Copy
+# mila:/network/scratch/o/ozgur.aslan/le-wm/cluv_data to
+# $SCRATCH/le-wm/cluv_data on each cluster with rsync from Mila instead.
+# data_source = "mila:/network/scratch/o/ozgur.aslan/le-wm/cluv_data"
 
 ## Where the dataset should be replicated on all clusters.
-datasets_path = "$SCRATCH/le-wm/cluv_data"
+# datasets_path = "$SCRATCH/le-wm/cluv_data"
 
 [tool.cluv.env]
 # Environment variables applied when using Slurm commands on all clusters.
