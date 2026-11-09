@@ -13,6 +13,7 @@ def detached_rollout(
     actions: torch.Tensor,
     horizon: int,
     history_size: int | None = None,
+    all_grad: bool = False,
 ) -> torch.Tensor:
     """Return future embeddings (B, horizon, D) without backprop through time.
 
@@ -23,6 +24,8 @@ def detached_rollout(
     All initial embeddings are detached. The first horizon - 1 steps run
     under no_grad; only the final step builds a graph, including its action
     encoder. The caller must detach supervision targets as well.
+    ``all_grad``: every step builds its own one-step graph (inputs still
+    detached), for losses on all predicted steps.
 
     This function preserves model train/eval mode. In training, prefix calls
     still use dropout and update BatchNorm statistics, as ordinary forwards
@@ -53,7 +56,9 @@ def detached_rollout(
         start = max(0, end - history_size)
         # nullcontext respects an enclosing validation no_grad context.
         grad_context = (
-            nullcontext() if step == horizon - 1 else torch.no_grad()
+            nullcontext()
+            if all_grad or step == horizon - 1
+            else torch.no_grad()
         )
         with grad_context:
             context = torch.stack(history[start:], dim=1).detach()

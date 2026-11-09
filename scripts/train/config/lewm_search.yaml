@@ -42,6 +42,11 @@ loss:
     # Clamp CEM/perturbed plans to the dataset's normalized action range (the
     # env clips raw actions to it anyway). GFlowNet samples are not clamped.
     clip_actions: false
+    # cem sampler only: average InfoNCE over every predicted step k (cost =
+    # MSE to the clip frame k blocks ahead) instead of only the last one.
+    # CEM elites are still chosen by the last-step cost. Without bptt each
+    # step gets only its one-step gradient (detached prefix).
+    all_steps: false
   gfn:
     num_samples: 56 # negatives per clip (CEM uses 16 perturbed + 40 elites)
     explore_std: 1.5 # widen sampling for exploration; TB stays exact

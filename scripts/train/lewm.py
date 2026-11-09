@@ -176,17 +176,20 @@ def search_batch(batch, emb, cfg):
     return batch, emb[:n]
 
 
-def plan_costs(model, batch, emb, cfg, plans):
+def plan_costs(model, batch, emb, cfg, plans, all_steps=False):
     """Goal MSE of each plan rolled out from the context: (B, S, T, A) -> (B, S).
 
     The goal is the clip frame ``horizon`` blocks after the last context
     frame, detached; gradients reach the model through the rollout.
+    ``all_steps``: (B, S, T) costs, step k against the clip frame k blocks
+    after the last context frame.
     """
     H, search = cfg.wm.history_size, cfg.loss.search
     T = search.horizon
     actions = batch['action']
     B = actions.size(0)
     goal = emb[:, H - 1 + T, None].detach()
+    targets = emb[:, None, H : H + T].detach()  # (B, 1, T, ...)
     skip = ('action', 'emb', 'act_emb')
     heads = max(
         (m.heads for m in model.modules() if hasattr(m, 'heads')), default=1
@@ -210,9 +213,17 @@ def plan_costs(model, batch, emb, cfg, plans):
         else:
             history = torch.cat([info['action_history'], plans], 2)
             preds = detached_rollout(
-                model, info['emb'].flatten(0, 1), history.flatten(0, 1), T, H
+                model,
+                info['emb'].flatten(0, 1),
+                history.flatten(0, 1),
+                T,
+                H,
+                all_grad=all_steps,
             )
             info['predicted_emb'] = preds.unflatten(0, (B, S))
+        if all_steps:
+            err = (info['predicted_emb'][:, :, -T:] - targets).pow(2)
+            return err.flatten(3).sum(-1)  # (B, S, T), GoalMSE per step
         info['goal_emb'] = goal
         return GoalMSE()(info)  # (B, S)
 
@@ -234,9 +245,16 @@ def clip_plans(plans, cfg):
 
 
 def search_loss(model, batch, emb, cfg):
-    """InfoNCE over goal costs: the expert plan must beat a short CEM's elites."""
+    """InfoNCE over goal costs: the expert plan must beat a short CEM's elites.
+
+    With ``all_steps`` the InfoNCE is averaged over every predicted step k,
+    each against the clip frame k blocks ahead; CEM still ranks by the last.
+    Without bptt each step gets only its one-step gradient from a detached
+    prefix.
+    """
     H, search = cfg.wm.history_size, cfg.loss.search
     T = search.horizon
+    all_steps = search.get('all_steps', False)
     batch, emb = search_batch(batch, emb, cfg)
     actions = batch['action']
     B = actions.size(0)
@@ -275,8 +293,10 @@ def search_loss(model, batch, emb, cfg):
         dtype=actions.dtype,
     )
     plans = torch.cat([expert, clip_plans(perturbed, cfg), *elites], 1)
-    costs = cost(plans)  # expert at index 0
-    target = costs.new_zeros(B, dtype=torch.long)
+    costs = plan_costs(model, batch, emb, cfg, plans, all_steps)  # expert 0
+    if all_steps:  # one InfoNCE per step: (B, S, T) -> (B * T, S)
+        costs = costs.transpose(1, 2).flatten(0, 1)
+    target = costs.new_zeros(costs.size(0), dtype=torch.long)
     return F.cross_entropy(-costs.float() / search.temperature, target)
 
 

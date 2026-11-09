@@ -76,6 +76,76 @@ def test_expert_plan_ranks_first_and_trains(search_loss, bptt):
         search_loss(model, short, short['emb'], cfg)
 
 
+@pytest.mark.parametrize('bptt', [True, False])
+def test_all_steps_infonce(search_loss, bptt):
+    torch.manual_seed(0)
+    H, T = 2, 3
+    cfg = OmegaConf.create(
+        {
+            'wm': {'history_size': H},
+            'loss': {
+                'search': {
+                    'horizon': T,
+                    'bptt': bptt,
+                    'cem_steps': 5,
+                    'num_samples': 15,
+                    'topk': 4,
+                    'num_perturbed': 6,
+                    'perturb_std': 0.5,
+                    'var_scale': 1.0,
+                    'temperature': 1e-3,
+                    'all_steps': True,
+                }
+            },
+        }
+    )
+    model = LeWMState(
+        encoder=_identity(2),
+        predictor=_Predictor(),
+        action_encoder=_identity(2),
+    )
+    actions = torch.randn(4, H + T, 2)
+    state = torch.cat([torch.zeros(4, 1, 2), actions[:, :-1].cumsum(1)], dim=1)
+    batch = model.encode({'state': state, 'action': actions})
+
+    # Per-step costs: the last step is the usual goal cost, the expert is 0.
+    plan_costs = search_loss.__globals__['plan_costs']
+    plans = torch.randn(4, 5, T, 2)
+    plans[:, 0] = actions[:, H - 1 : H - 1 + T]
+    emb = batch['emb']
+    per_step = plan_costs(model, batch, emb, cfg, plans, all_steps=True)
+    assert per_step.shape == (4, 5, T)
+    last = plan_costs(model, batch, emb, cfg, plans)
+    torch.testing.assert_close(per_step[..., -1], last)
+    assert per_step[:, 0].abs().max() < 1e-5
+
+    loss = search_loss(model, batch, emb, cfg)
+    assert loss < 0.5 * math.log(1 + 6 + 5 * 4)
+    loss.backward()
+    assert model.action_encoder.weight.grad.abs().sum() > 0
+
+
+def test_detached_rollout_all_grad():
+    from stable_worldmodel.wm.lewm.detached_rollout import detached_rollout
+
+    torch.manual_seed(0)
+    model = LeWMState(
+        encoder=_identity(2),
+        predictor=_Predictor(),
+        action_encoder=_identity(2),
+    )
+    initial = torch.randn(2, 2, 2)
+    actions = torch.randn(2, 1 + 4, 2)
+    preds = detached_rollout(model, initial, actions, 4, 2, all_grad=True)
+    plain = detached_rollout(model, initial, actions, 4, 2)
+    torch.testing.assert_close(preds, plain)
+    # Default: an early step has no graph; all_grad: it does.
+    plain[:, 1].sum().backward()
+    assert model.action_encoder.weight.grad.abs().sum() == 0
+    preds[:, 1].sum().backward()
+    assert model.action_encoder.weight.grad.abs().sum() > 0
+
+
 def test_uint8_pixels_match_float_preprocessing():
     pytest.importorskip('stable_pretraining')
     script = Path(__file__).resolve().parents[2] / 'scripts/train/lewm.py'
