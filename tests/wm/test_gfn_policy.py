@@ -115,6 +115,59 @@ def test_gfn_search_loss_splits_gradients(lewm_script):
     assert all(p.grad is None for p in model.parameters())
 
 
+def test_extra_policy_steps_update_only_the_policy(lewm_script):
+    from types import SimpleNamespace
+
+    torch.manual_seed(0)
+    H, T = 2, 3
+    cfg = OmegaConf.create(
+        {
+            'wm': {'history_size': H},
+            'loss': {
+                'search': {'horizon': T, 'bptt': True, 'temperature': 1.0},
+                'gfn': {
+                    'num_samples': 5,
+                    'explore_std': 1.5,
+                    'tau_start': 2.0,
+                    'tau_end': 0.2,
+                    'anneal_steps': 10,
+                    'expert_tb': True,
+                    'policy_steps': 4,
+                },
+            },
+        }
+    )
+    model = LeWMState(
+        encoder=_identity(2),
+        predictor=_Predictor(),
+        action_encoder=_identity(2),
+    )
+    policy = PlanGFlowNet(emb_dim=2, action_dim=2, horizon=T, hidden_dim=8)
+    opt = torch.optim.SGD(policy.parameters(), lr=0.1)
+    steps = []
+    step = opt.step
+    opt.step = lambda: (steps.append(1), step())[1]
+    module = SimpleNamespace(
+        model=model,
+        gfn_policy=policy,
+        _optimizer_index_to_name={0: 'model_opt', 1: 'policy_opt'},
+        optimizers=lambda: [None, SimpleNamespace(optimizer=opt)],
+        trainer=SimpleNamespace(gradient_clip_val=1.0),
+    )
+    actions = torch.randn(4, H + T, 2)
+    state = torch.cat([torch.zeros(4, 1, 2), actions[:, :-1].cumsum(1)], 1)
+    batch = model.encode({'state': state, 'action': actions})
+    before = [p.detach().clone() for p in policy.parameters()]
+
+    lewm_script.gfn_extra_policy_steps(module, batch, batch['emb'], cfg, 5)
+    assert len(steps) == 3  # policy_steps - 1; the joint step does the last
+    assert any(
+        not torch.equal(a, b) for a, b in zip(before, policy.parameters())
+    )
+    assert all(p.grad is None for p in model.parameters())
+    assert all(p.grad is None for p in policy.parameters())
+
+
 def test_evaluator_clamps_candidates_to_action_bounds():
     from stable_worldmodel.planning.evaluator import ShootingCostEvaluator
 

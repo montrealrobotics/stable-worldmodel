@@ -61,9 +61,9 @@ loss:
     # random plans cost ~5x the expert).
     relative_cost: false
     expert_tb: true # also fit TB on the expert plan (off-policy)
-    # Policy steps per world-model step; the world model accumulates this many
-    # batches per update, so 10k batches give 10k / wm_every updates.
-    wm_every: 16
+    # Policy updates per batch; the world model updates once per batch. The
+    # extra policy_steps - 1 updates reuse the batch with a frozen world model.
+    policy_steps: 2
     optimizer:
       type: AdamW
       lr: 3e-4

@@ -313,14 +313,14 @@ def gfn_log_reward(costs, plans, gfn, tau):
     return log_r
 
 
-def gfn_search_loss(model, policy, batch, emb, cfg, step):
+def gfn_search_loss(model, policy, batch, emb, cfg, step, policy_only=False):
     """InfoNCE with GFlowNet negatives, plus the policy's trajectory balance.
 
     The policy samples plans in proportion to exp(-cost / tau) under the
     current world model, so the negatives cover every basin the model scores
     well. The world model gets only the InfoNCE gradient (samples and
     conditions are detached); the policy gets only trajectory balance on
-    detached rewards.
+    detached rewards. ``policy_only``: costs without grad, no InfoNCE.
     """
     H, search, gfn = cfg.wm.history_size, cfg.loss.search, cfg.loss.gfn
     T = search.horizon
@@ -336,9 +336,12 @@ def gfn_search_loss(model, policy, batch, emb, cfg, step):
             z0, z_goal, gfn.num_samples, T, std_scale=gfn.explore_std
         ).to(expert.dtype)
     plans = torch.cat([expert, samples], 1)
-    costs = plan_costs(model, batch, emb, cfg, plans)  # expert at index 0
-    target = costs.new_zeros(costs.size(0), dtype=torch.long)
-    infonce = F.cross_entropy(-costs.float() / search.temperature, target)
+    with torch.set_grad_enabled(torch.is_grad_enabled() and not policy_only):
+        costs = plan_costs(model, batch, emb, cfg, plans)  # expert at index 0
+    infonce = None
+    if not policy_only:
+        target = costs.new_zeros(costs.size(0), dtype=torch.long)
+        infonce = F.cross_entropy(-costs.float() / search.temperature, target)
 
     tau = gfn_temperature(gfn, step)
     log_r = gfn_log_reward(costs.detach(), plans, gfn, tau)
@@ -361,6 +364,36 @@ def gfn_search_loss(model, policy, batch, emb, cfg, step):
         # > 0: the sampled plans beat the expert under the world model.
         'gfn_expert_margin': (costs[:, :1] - costs[:, 1:]).detach().mean(),
     }
+
+
+def gfn_extra_policy_steps(self, batch, emb, cfg, step):
+    """Fit the policy ``policy_steps - 1`` extra times on this batch.
+
+    Runs before the joint step, which makes the last policy update together
+    with the world-model update. The world model is frozen here, so ``emb``
+    is reused and costs need no grad. Uses the raw optimizer so Lightning's
+    step counters (and max_steps) still count one step per batch.
+    """
+    k = cfg.loss.gfn.get('policy_steps', 1)
+    if k <= 1 or not torch.is_grad_enabled():
+        return
+    names = self._optimizer_index_to_name
+    idx = next(i for i, n in names.items() if n == 'policy_opt')
+    opt = self.optimizers()[idx].optimizer
+    params = list(self.gfn_policy.parameters())
+    clip = self.trainer.gradient_clip_val
+    emb = emb.detach()
+    for _ in range(k - 1):
+        out = gfn_search_loss(
+            self.model, self.gfn_policy, batch, emb, cfg, step, True
+        )
+        tb = out['gfn_tb_loss']
+        opt.zero_grad(set_to_none=True)
+        tb.backward()
+        if clip:
+            torch.nn.utils.clip_grad_norm_(params, clip)
+        opt.step()
+    opt.zero_grad(set_to_none=True)
 
 
 def normalize_pixels(batch):
@@ -444,13 +477,11 @@ def lejepa_forward(self, batch, stage, cfg):
     search = getattr(cfg.loss, 'search', None)
     gfn_logs = {}
     if search and search.weight > 0 and search.get('sampler', 'cem') == 'gfn':
+        step = self.trainer.fit_loop.total_batch_idx  # batches, not opt steps
+        if stage == 'fit':
+            gfn_extra_policy_steps(self, batch, emb, cfg, step)
         gfn = gfn_search_loss(
-            self.model,
-            self.gfn_policy,
-            batch,
-            emb,
-            cfg,
-            self.trainer.fit_loop.total_batch_idx,  # batches, not opt steps
+            self.model, self.gfn_policy, batch, emb, cfg, step
         )
         output['search_loss'] = gfn.pop('search_loss')
         output['gfn_tb_loss'] = gfn.pop('gfn_tb_loss')
@@ -638,8 +669,6 @@ def run(cfg):
         extra_modules['aux_head'] = torch.nn.Linear(cfg.embed_dim, 2)
     search = cfg.loss.get('search') or {}
     use_gfn = search.get('weight', 0) > 0 and search.get('sampler') == 'gfn'
-    # GFlowNet sampler: the world model steps once per wm_every policy steps.
-    wm_every = cfg.loss.gfn.wm_every if use_gfn else 1
     optimizers = {
         'model_opt': {
             'modules': 'model|aux_head' if aux_col else 'model',
@@ -647,14 +676,11 @@ def run(cfg):
             'scheduler': {
                 'type': 'LinearWarmupCosineAnnealingLR',
                 'warmup_steps': max(
-                    1,
-                    int(cfg.get('warmup_ratio', 0.01) * total_steps)
-                    // wm_every,
+                    1, int(cfg.get('warmup_ratio', 0.01) * total_steps)
                 ),
-                'max_steps': max(1, total_steps // wm_every),
+                'max_steps': max(1, total_steps),
             },
             'interval': 'epoch',
-            'frequency': wm_every,
         },
     }
     if use_gfn:
