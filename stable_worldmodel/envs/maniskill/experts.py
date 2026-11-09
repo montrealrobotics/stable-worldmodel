@@ -318,3 +318,37 @@ def collection_defaults(checkpoint):
             )
         defaults.update(camera_name=name, image_size=camera['width'])
     return defaults, config
+
+
+def validate_collection_checkpoint(weights, policy_type, action_shape=None):
+    """Reject incompatible policy/control settings before constructing an agent.
+
+    Weights identify the policy family and output size, but do not identify the
+    training environment, camera configuration, or control semantics.
+    """
+    detected = (
+        'rgb'
+        if any(key.startswith('feature_net.') for key in weights)
+        else 'state'
+    )
+    guidance = (
+        'Keep the original training_config.json beside the checkpoint, or pass '
+        'the original --policy-type, --encoder, --env-id, --control-mode, '
+        '--camera-name and --image-size settings explicitly. '
+        'For an overhead RGB XY expert, use slurm_scripts/collect_overhead_rgb_dataset.sbatch.'
+    )
+    if detected != policy_type:
+        raise ValueError(
+            f'Checkpoint contains a {detected} policy, but collection selected {policy_type}. '
+            + guidance
+        )
+    logstd = weights.get('actor_logstd')
+    if action_shape is not None and logstd is not None:
+        expected = int(logstd.shape[-1])
+        actual = math.prod(action_shape)
+        if expected != actual:
+            raise ValueError(
+                f'Checkpoint expects {expected} actions, but the collection environment '
+                f'provides {actual}. Check --env-id and --control-mode. '
+                + guidance
+            )
