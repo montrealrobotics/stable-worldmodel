@@ -657,7 +657,8 @@ def test_select_alternatives_keeps_successful_slots_in_order():
         (episode(slot // 4, slot), float(slot), success)
         for slot, success in enumerate(successes)
     ]
-    groups = _collect.select_alternatives(batch, 4, 2)
+    groups, similar = _collect.select_alternatives(batch, 4, 2)
+    assert similar == 0
     assert [[(r[0], r[1], r[2]['action'][0]) for r in g] for g in groups] == [
         [
             ('deterministic', -1, 0),
@@ -669,3 +670,34 @@ def test_select_alternatives_keeps_successful_slots_in_order():
     batch[1] = (episode(9, 1), 1.0, False)
     with pytest.raises(ValueError, match='initial state'):
         _collect.select_alternatives(batch, 4, 2)
+
+
+def test_select_alternatives_drops_paths_too_close_to_kept_ones():
+    def episode(offset, tag, length=10):
+        x = np.linspace(0, 1, length)
+        path = np.stack([x, np.full(length, offset), np.zeros(length)], 1)
+        return {
+            'state': [np.zeros(2, np.float32)],
+            'action': [tag],
+            'obs_extra_tcp_pose': list(path),
+        }
+
+    # Offsets from the expert path (0): 0.005 too close to the expert,
+    # 0.05 kept, 0.06 too close to 0.05, 0.12 kept; slot 4 failed.
+    batch = [
+        (episode(0.0, 0), 0.0, True),
+        (episode(0.005, 1, length=7), 0.0, True),
+        (episode(0.05, 2), 0.0, True),
+        (episode(0.06, 3), 0.0, True),
+        (episode(0.3, 4), 0.0, False),
+        (episode(0.12, 5), 0.0, True),
+    ]
+    groups, similar = _collect.select_alternatives(
+        batch, 6, 3, min_distance=0.02
+    )
+    assert [r[2]['action'][0] for r in groups[0]] == [0, 2, 5]
+    assert [r[1] for r in groups[0]] == [-1, 0, 1]
+    assert similar == 2
+    assert _collect.path_distance(
+        np.array([[0, 0], [1, 0]]), np.array([[0, 1], [0.5, 1], [1, 1]])
+    ) == pytest.approx(1.0)

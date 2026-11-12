@@ -171,6 +171,14 @@ def parse_args():
         'expert episodes are dropped with their alternatives.',
     )
     parser.add_argument(
+        '--min-path-distance',
+        type=float,
+        default=20.0,
+        help='Alternatives: drop a successful alternative whose gripper XY path '
+        '(resampled over normalized time) is on average closer than this many '
+        'mm to the expert or to an already kept alternative; 0 disables.',
+    )
+    parser.add_argument(
         '--candidates',
         type=int,
         default=16,
@@ -289,6 +297,11 @@ def parse_args():
                 '--alternatives needs deterministic experts, no noisy replays '
                 'and no correct chunks'
             )
+        if (
+            not math.isfinite(args.min_path_distance)
+            or args.min_path_distance < 0
+        ):
+            parser.error('--min-path-distance must be finite and nonnegative')
         if (
             args.candidates <= args.alternatives
             or args.num_envs % args.candidates
@@ -883,39 +896,73 @@ def collect_correct_chunk_batch(
     ]
 
 
-def select_alternatives(batch, candidates, num_alternatives):
-    """Group expert episodes (slot 0) with their first successful alternatives.
+def path_distance(a, b, points=50):
+    """Mean distance between two XY paths resampled over normalized time."""
+    import numpy as np
+
+    def resample(path):
+        path = np.asarray(path, dtype=np.float64)
+        t, u = np.linspace(0, 1, len(path)), np.linspace(0, 1, points)
+        return np.stack([np.interp(u, t, path[:, i]) for i in range(2)], 1)
+
+    return float(np.linalg.norm(resample(a) - resample(b), axis=1).mean())
+
+
+def select_alternatives(
+    batch,
+    candidates,
+    num_alternatives,
+    min_distance=0.0,
+    path_key='obs_extra_tcp_pose',
+):
+    """Group expert episodes (slot 0) with distinct successful alternatives.
 
     batch holds (episode, return, success) per slot, `candidates` consecutive
-    slots per group, all reset from the group's seed. Returns per group the
-    expert followed by up to `num_alternatives` successful other slots, as
-    (mode, replay_idx, episode, return, success, fallback_chunks).
+    slots per group, all starting from the group's expert state. Successful
+    slots are kept in order while their gripper XY path (`path_key`) is at
+    least `min_distance` (same units, see path_distance) from the expert's and
+    every kept alternative's path, up to `num_alternatives`. Returns per group
+    (mode, replay_idx, episode, return, success, fallback_chunks) tuples, the
+    expert first, and the number of successes rejected as too similar.
     """
     import numpy as np
 
-    groups = []
+    groups, too_similar = [], 0
     for first in range(0, len(batch), candidates):
         expert, *others = batch[first : first + candidates]
         start = expert[0]['state'][0]
         rollouts = [('deterministic', -1, *expert, 0)]
+        paths = []
+        if min_distance:
+            paths.append(np.asarray(expert[0][path_key])[:, :2])
         for episode, episode_return, success in others:
             if not np.allclose(episode['state'][0], start):
                 raise ValueError(
                     'Alternative did not start from the expert initial state'
                 )
-            if success and len(rollouts) <= num_alternatives:
-                rollouts.append(
-                    (
-                        'alternative',
-                        len(rollouts) - 1,
-                        episode,
-                        episode_return,
-                        success,
-                        0,
-                    )
+            if not success or len(rollouts) > num_alternatives:
+                continue
+            if min_distance:
+                path = np.asarray(episode[path_key])[:, :2]
+                if (
+                    min(path_distance(path, kept) for kept in paths)
+                    < min_distance
+                ):
+                    too_similar += 1
+                    continue
+                paths.append(path)
+            rollouts.append(
+                (
+                    'alternative',
+                    len(rollouts) - 1,
+                    episode,
+                    episode_return,
+                    success,
+                    0,
                 )
+            )
         groups.append(rollouts)
-    return groups
+    return groups, too_similar
 
 
 def write_episode_batch(writer, episodes, batch_size):
@@ -1065,6 +1112,7 @@ def main():
         total_steps = 0
         successes = 0
         dropped_groups = 0
+        too_similar = 0
         modes = episode_modes(
             args.num_episodes, args.policy_mode, args.mix_weights, args.seed
         )
@@ -1123,9 +1171,14 @@ def main():
                             noise_seed=args.seed + start,
                             sources=[i // n * n for i in range(num_envs)],
                         )
-                        groups = select_alternatives(
-                            batch, n, args.alternatives
-                        )[:count]
+                        groups, similar = select_alternatives(
+                            batch,
+                            n,
+                            args.alternatives,
+                            min_distance=args.min_path_distance / 1000,
+                        )
+                        groups = groups[:count]
+                        too_similar += similar
                         del batch
                     else:
                         batch_modes = modes[start : start + count] + [
@@ -1257,6 +1310,7 @@ def main():
                         f'Episodes {completed}/{args.num_episodes}: '
                         f'{rate:.2f} episodes/s {total_steps / elapsed:.0f} steps/s '
                         f'success={successes / completed:.3f} saved={len(episode_summaries)} '
+                        f'too_similar={too_similar} '
                         f'ETA={(args.num_episodes - completed) / rate / 3600:.2f}h '
                         f'200k_projection={200000 / rate / 3600:.2f}h',
                         flush=True,
@@ -1271,6 +1325,7 @@ def main():
             successful_episodes=successes,
             saved_episodes=len(episode_summaries),
             dropped_failed_groups=dropped_groups,
+            alternatives_too_similar=too_similar,
             policy_training_config=training_config,
             stop_on_success=True,
             episodes=episode_summaries,
