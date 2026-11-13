@@ -159,7 +159,7 @@ def task_pose(base, flat):
     """T xy, T yaw and TCP xy of flat sim states (loads them into the env)."""
     from stable_worldmodel.envs.maniskill.chunks import snapshot
 
-    base.set_state(flat)
+    base.set_state(flat.to(base.device))
     s = snapshot(base)
     return s['tee_xy'], s['tee_yaw'], s['tcp_xy']
 
@@ -184,8 +184,9 @@ def verify(base, frames, states, clip_pixels, clip_states, H, M, B):
     close to the spread means the drift is physics, not a bug.
     Block 0 tests the restore alone.
     """
-    sim_px = torch.stack(frames, 1).permute(0, 1, 4, 2, 3).float()
-    sim_st = torch.stack(states, 1).float()
+    dev = clip_states.device  # the CPU sim keeps its tensors on the CPU
+    sim_px = torch.stack(frames, 1).permute(0, 1, 4, 2, 3).float().to(dev)
+    sim_st = torch.stack(states, 1).float().to(dev)
     ref_px = clip_pixels[:, H - 1 :].float().repeat_interleave(M, 0)
     ref_st = clip_states[:, H - 1 :].repeat_interleave(M, 0)
     print(
@@ -277,16 +278,16 @@ def main():
             # Every plan of a clip starts from that clip's state. The reset only
             # clears episode counters; set_state overwrites the scene.
             env.reset()
-            base.set_state(start_state.repeat_interleave(M, 0))
+            base.set_state(start_state.repeat_interleave(M, 0).to(base.device))
             base.agent.set_controller_state(
-                {'arm': {'target_pose': target.repeat_interleave(M, 0)}}
+                {'arm': {'target_pose': target.repeat_interleave(M, 0).to(base.device)}}
             )
             obs = base.get_obs()
             frames = [pixels(obs).clone()]
             states = [base.get_state().clone()]
             for k in range(T):
                 for j in range(fs):
-                    obs, *_ = env.step(raw[:, k * fs + j])
+                    obs, *_ = env.step(raw[:, k * fs + j].to(base.device))
                 frames.append(pixels(obs).clone())
                 states.append(base.get_state().clone())
 
