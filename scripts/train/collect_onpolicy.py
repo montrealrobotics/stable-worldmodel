@@ -60,6 +60,12 @@ def parse_args():
     p.add_argument('--control-mode', default='pd_ee_delta_xy')
     p.add_argument('--jpeg-quality', type=int, default=95)
     p.add_argument(
+        '--reconfigure',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='rebuild the sim scene before each batch (reproducible rollouts)',
+    )
+    p.add_argument(
         '--verify',
         action='store_true',
         help='replay the expert plan from one batch of restored states, '
@@ -270,9 +276,13 @@ def main():
             )
             raw = torch.maximum(torch.minimum(raw, high), low)
 
-            # Every plan of a clip starts from that clip's state. The reset only
-            # clears episode counters; set_state overwrites the scene.
-            env.reset()
+            # Every plan of a clip starts from that clip's state; set_state
+            # overwrites the scene. reconfigure rebuilds it first: reset and
+            # set_state keep PhysX solver state (warm starts, contact caches)
+            # from earlier steps, which makes restored rollouts depend on the
+            # slot's history; after a rebuild they are bit-reproducible
+            # (scripts/data/check_replay_determinism.py, runs C and D).
+            env.reset(options={'reconfigure': True} if args.reconfigure else None)
             base.set_state(start_state.repeat_interleave(M, 0).to(base.device))
             base.agent.set_controller_state(
                 {'arm': {'target_pose': target.repeat_interleave(M, 0).to(base.device)}}
