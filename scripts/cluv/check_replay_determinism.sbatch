@@ -38,8 +38,19 @@ MANI_EXPS_DIR="${MANI_EXPS_DIR:-$HOME/git/mani-exps}"
 export LD_LIBRARY_PATH="$MANI_EXPS_DIR/.local-vulkan/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
 
-python scripts/data/check_replay_determinism.py \
-  --dataset "${ARCHIVE_NAME%.tar.gz}" \
-  --cache-dir "$SLURM_TMPDIR" \
-  --collection-json "$COLLECTION_JSON" \
-  "$@"
+run() {
+  python scripts/data/check_replay_determinism.py \
+    --dataset "${ARCHIVE_NAME%.tar.gz}" \
+    --cache-dir "$SLURM_TMPDIR" \
+    --collection-json "$COLLECTION_JSON" \
+    "$@"
+}
+# FRESH_PAIR=1: run twice in separate processes (each a fresh sim); the second
+# compares its A1 replay with the first's.
+if [[ -n "${FRESH_PAIR:-}" ]]; then
+  run --save "$SLURM_TMPDIR/a1.pt" "$@"
+  echo "=== second process ==="
+  run --compare "$SLURM_TMPDIR/a1.pt" "$@"
+else
+  run "$@"
+fi

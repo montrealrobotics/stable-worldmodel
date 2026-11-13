@@ -9,6 +9,9 @@ in the dataset, and replays their recorded actions open loop:
   B       same seeds and slots, but restore the recorded state (and
           controller target) at step --restore-step and replay from there:
           what a mid-episode restore loses (solver warm start etc.).
+  --save / --compare: A1 of two separate processes, each in a fresh sim.
+          Bit-exact means the GPU sim is deterministic and A2 vs A1 drift
+          comes from solver state carried over from the previous run.
 
 Per 5-step block it prints the T position (mm), T yaw (deg) and TCP (mm)
 errors against the dataset, plus the max abs flat-state difference
@@ -36,6 +39,12 @@ def parse_args():
     p.add_argument('--collection-json', required=True, type=Path)
     p.add_argument('--batch', type=int, default=0, help='index among complete batches')
     p.add_argument('--restore-step', type=int, default=10)
+    p.add_argument('--save', type=Path, help='save the A1 states (.pt)')
+    p.add_argument(
+        '--compare',
+        type=Path,
+        help='A1 states saved by another process: fresh-vs-fresh check',
+    )
     return p.parse_args()
 
 
@@ -185,6 +194,13 @@ def main():
             poses['B'], ref_pose, runs['B'], ref, valid & (steps >= t0)
         ),
     }
+    if args.compare is not None:
+        other = torch.load(args.compare).to(device)
+        table['A1 vs A1 of another fresh process'] = errors(
+            poses['A1'], decode(base, other), runs['A1'], other, valid
+        )
+    if args.save is not None:
+        torch.save(runs['A1'].cpu(), args.save)
     print(f'batch_seed {batch_seed}: {n} expert episodes, lengths {int(lengths.min())}-{T}')
     print('T mm / yaw deg / TCP mm as mean (max) over the episodes still running; flat = max |state diff|')
     for name, (tee, yaw, tcp, flat) in table.items():
