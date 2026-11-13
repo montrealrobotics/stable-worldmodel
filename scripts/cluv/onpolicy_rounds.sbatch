@@ -66,11 +66,13 @@ for r in $(seq 1 "$ROUNDS"); do
   if [[ ! -e "$data" ]]; then
     # Collect under a temporary name so an interrupted round is never reused.
     tmp="$SCRATCH/le-wm/onpolicy/${run}_tmp.lance"
-    rm -rf "$tmp" "${tmp%.lance}.collection.json"
+    rm -rf "$tmp" "${tmp%.lance}_episodes.lance" "${tmp%.lance}.collection.json"
     python scripts/train/collect_onpolicy.py \
       --checkpoint "$model" --dataset "$DATASET_NAME" --cache-dir "$SLURM_TMPDIR" \
       --output "$tmp" --num-clips "$NUM_CLIPS" --seed "$r"
     mv "${tmp%.lance}.collection.json" "${data%.lance}.collection.json"
+    # LanceWriter keeps per-episode metadata in a <table>_episodes side table.
+    mv "${tmp%.lance}_episodes.lance" "${data%.lance}_episodes.lance"
     mv "$tmp" "$data"
   fi
   collected="${collected:+$collected,}$data"
