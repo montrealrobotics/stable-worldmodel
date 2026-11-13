@@ -302,8 +302,10 @@ def main():
             frames = torch.stack(frames, 1).cpu().numpy()  # (N, T+1, h, w, 3)
             states = torch.stack(states, 1).float().cpu().numpy()
             blocks = raw.reshape(B * M, T, fs * adim).float().cpu().numpy()
-            pad = np.full((B * M, 1, fs * adim), np.nan, dtype=np.float32)
-            blocks = np.concatenate([blocks, pad], 1)  # last frame: no action
+            # The last frame has no action after it; Lance rejects NaN in vector
+            # columns, and one-step training never reads this row's action.
+            pad = np.zeros((B * M, 1, fs * adim), dtype=np.float32)
+            blocks = np.concatenate([blocks, pad], 1)
             pred, expert, slot = pred.cpu(), expert.cpu(), slot.cpu()
             stats['pred_cost'].append(pred)
             stats['expert_cost'].append(expert)
@@ -347,7 +349,7 @@ def main():
         'num_clips': num_clips,
         'rollouts': written,
         'rows_per_rollout': T + 1,
-        'layout': 'one row per action block; action = frameskip raw actions, NaN on the last row',
+        'layout': 'one row per action block; action = frameskip raw actions, zeros on the last row (unused)',
         'mean_predicted_cost': {
             'noisy': float(pred[:, : args.num_noisy].mean()),
             'elite': float(pred[:, args.num_noisy :].mean()),
