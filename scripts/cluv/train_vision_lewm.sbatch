@@ -17,8 +17,10 @@ set -euo pipefail
 
 DATASET_ARCHIVE=""
 RUN_NAME="lewm_vision"
+CONFIG_NAME="${CONFIG_NAME:-lewm}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --config=*) CONFIG_NAME="${1#*=}"; shift ;;
     --dataset=*) DATASET_ARCHIVE="${1#*=}"; shift ;;
     --run-name=*) RUN_NAME="${1#*=}"; shift ;;
     *) break ;;
@@ -42,7 +44,7 @@ RUN_NAME="${RUN_NAME}_${SLURM_JOB_ID}"
 # Compute nodes may be offline (UV_OFFLINE=1): the extras must already be in
 # the uv cache, e.g. from `cluv run <cluster> uv sync --extra train --extra data`.
 uv run --extra train --extra data python scripts/train/lewm.py \
-  --config-name="${CONFIG_NAME:-lewm}" \
+  --config-name="$CONFIG_NAME" \
   data=maniskill_vision \
   data.dataset.name="$DATASET_NAME" \
   output_model_name="$RUN_NAME" \

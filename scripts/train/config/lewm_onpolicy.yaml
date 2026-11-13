@@ -1,0 +1,26 @@
+# On-policy post-training (DAgger-style rounds), the alternative to the search
+# InfoNCE: the plans the search loss would rank (CEM elites + noisy experts)
+# are executed in the simulator by scripts/train/collect_onpolicy.py, and the
+# real rollouts are trained with the plain LeWM loss (one-step MSE + SIGReg),
+# mixed into the original data. Same post-training settings as lewm_search.
+defaults:
+  - lewm_search
+  - _self_
+
+output_model_name: lewm_onpolicy
+
+data:
+  dataset:
+    # Plain LeWM clips: one-step prediction, so every block transition of a
+    # rollout is a training clip.
+    num_steps: ${eval:'${wm.history_size} + ${wm.num_preds}'}
+
+loss:
+  search:
+    weight: 0 # no InfoNCE; the search block only configures the collector
+
+onpolicy:
+  # Rollout datasets (absolute .lance paths) from collect_onpolicy.py. Pass
+  # every round collected so far to aggregate them, DAgger-style.
+  datasets: []
+  frac: 0.5 # share of each batch drawn from the rollouts

@@ -244,18 +244,15 @@ def clip_plans(plans, cfg):
     return torch.maximum(torch.minimum(plans, high), low)
 
 
-def search_loss(model, batch, emb, cfg):
-    """InfoNCE over goal costs: the expert plan must beat a short CEM's elites.
+def search_negatives(model, batch, emb, cfg):
+    """Expert plan, perturbed experts and CEM elites: (B, 1 + P + E, T, A).
 
-    With ``all_steps`` the InfoNCE is averaged over every predicted step k,
-    each against the clip frame k blocks ahead; CEM still ranks by the last.
-    Without bptt each step gets only its one-step gradient from a detached
-    prefix.
+    Index 0 is the expert, then ``num_perturbed`` noisy experts, then the
+    ``cem_steps * topk`` elites in CEM-round order. Also used by the
+    on-policy collector to pick the plans it executes in the simulator.
     """
     H, search = cfg.wm.history_size, cfg.loss.search
     T = search.horizon
-    all_steps = search.get('all_steps', False)
-    batch, emb = search_batch(batch, emb, cfg)
     actions = batch['action']
     B = actions.size(0)
     expert = actions[:, None, H - 1 : H - 1 + T]
@@ -292,7 +289,21 @@ def search_loss(model, batch, emb, cfg):
         device=actions.device,
         dtype=actions.dtype,
     )
-    plans = torch.cat([expert, clip_plans(perturbed, cfg), *elites], 1)
+    return torch.cat([expert, clip_plans(perturbed, cfg), *elites], 1)
+
+
+def search_loss(model, batch, emb, cfg):
+    """InfoNCE over goal costs: the expert plan must beat a short CEM's elites.
+
+    With ``all_steps`` the InfoNCE is averaged over every predicted step k,
+    each against the clip frame k blocks ahead; CEM still ranks by the last.
+    Without bptt each step gets only its one-step gradient from a detached
+    prefix.
+    """
+    search = cfg.loss.search
+    all_steps = search.get('all_steps', False)
+    batch, emb = search_batch(batch, emb, cfg)
+    plans = search_negatives(model, batch, emb, cfg)
     costs = plan_costs(model, batch, emb, cfg, plans, all_steps)  # expert 0
     if all_steps:  # one InfoNCE per step: (B, S, T) -> (B * T, S)
         costs = costs.transpose(1, 2).flatten(0, 1)
@@ -458,6 +469,7 @@ def lejepa_forward(self, batch, stage, cfg):
         progress = self.global_step / total
     lambd = sigreg_weight(cfg.loss.sigreg, progress)
 
+    search_clips = batch.pop('search', None)  # see WithSearchClips
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
     normalize_pixels(batch)
@@ -511,6 +523,18 @@ def lejepa_forward(self, batch, stage, cfg):
             + search.weight * output['search_loss']
             + output['gfn_tb_loss']
         )
+    elif search and search.weight > 0 and search.get('separate_clips'):
+        # Own longer clips (training only; validation batches carry none).
+        if search_clips is not None:
+            search_clips['action'] = torch.nan_to_num(search_clips['action'], 0.0)
+            normalize_pixels(search_clips)
+            s_emb = self.model.encode(search_clips)['emb']
+            output['search_loss'] = search_loss(
+                self.model, search_clips, s_emb, cfg
+            )
+            output['loss'] = (
+                output['loss'] + search.weight * output['search_loss']
+            )
     elif search and search.weight > 0:
         output['search_loss'] = search_loss(self.model, batch, emb, cfg)
         output['loss'] = output['loss'] + search.weight * output['search_loss']
@@ -551,6 +575,52 @@ def lejepa_forward(self, batch, stage, cfg):
             # Log only once per optimizer step with gradient accumulation.
             self._last_gradient_diagnostics_step = step
     return output
+
+
+def mix_onpolicy(
+    train_set, onpolicy, dataset_cfg, cfg, action_scaler, action_dim
+):
+    """Add on-policy rollout datasets (see collect_onpolicy.py) to training.
+
+    Rollouts store one row per action block (frameskip 1, ``frameskip``
+    raw actions per row), so they are read with frameskip 1 and the main
+    dataset's action scaler applied per raw action.
+    """
+    from stable_worldmodel.data.mixing import MixDataset, block_normalizer
+
+    keys = list(cfg.data.dataset.keys_to_load)
+    unsupported = [
+        k for k in keys if not (k.startswith('pixels') or k == 'action')
+    ]
+    if unsupported:
+        raise ValueError(f'on-policy data has no columns {unsupported}')
+    extra_cfg = {
+        **{k: v for k, v in dataset_cfg.items() if k != 'cache_dir'},
+        'frameskip': 1,
+    }
+    transform = spt.data.transforms.Compose(
+        *[
+            get_img_preprocessor(
+                source=k, target=k, img_size=cfg.img_size, uint8=True
+            )
+            for k in keys
+            if k.startswith('pixels')
+        ],
+        block_normalizer(action_scaler, action_dim),
+    )
+    extras = []
+    for path in onpolicy.datasets:
+        ds = swm.data.load_dataset(str(path), transform=None, **extra_cfg)
+        ds.transform = transform
+        print(f'On-policy data "{path}": {len(ds)} clips')
+        extras.append(ds)
+    extra = extras[0] if len(extras) == 1 else swm.data.ConcatDataset(extras)
+    mixed = MixDataset(train_set, extra, onpolicy.get('frac', 0.5))
+    print(
+        f'Training mix: {mixed.n_main} dataset clips + {mixed.n_extra} '
+        f'on-policy draws ({len(extra)} unique clips)'
+    )
+    return mixed
 
 
 @hydra.main(version_base=None, config_path='./config', config_name='lewm')
@@ -647,10 +717,51 @@ def run(cfg):
         generator=rnd_gen,
     )
 
+    # On-policy rounds: mix simulator rollouts of the model's own plans into
+    # the training split only (validation stays on the original data).
+    onpolicy = cfg.get('onpolicy') or {}
+    if onpolicy.get('datasets'):
+        train_set = mix_onpolicy(
+            train_set,
+            onpolicy,
+            dataset_cfg,
+            cfg,
+            action_scaler,
+            dataset.get_dim('action'),
+        )
+
+    # Search loss on its own clips: the main loss keeps its short clips (all
+    # episodes, base-run epochs) and each batch adds search.batch_size clips
+    # of history + horizon frames for the InfoNCE.
+    search_cfg = cfg.loss.get('search') or {}
+    loader_extra = {}
+    if search_cfg.get('weight', 0) > 0 and search_cfg.get('separate_clips'):
+        from stable_worldmodel.data.mixing import (
+            WithSearchClips,
+            collate_with_search,
+        )
+
+        if not search_cfg.get('batch_size'):
+            raise ValueError('separate_clips needs loss.search.batch_size')
+        clip_cfg = {
+            **dataset_cfg,
+            'num_steps': cfg.wm.history_size + search_cfg.horizon,
+        }
+        search_set = swm.data.load_dataset(
+            dataset_name, transform=None, cache_dir=cache_dir, **clip_cfg
+        )
+        search_set.transform = transform
+        if replay_filter:
+            search_set = filter_replay_episodes(search_set, **replay_filter)
+        print(f'Search clips: {len(search_set)} of {clip_cfg["num_steps"]} frames')
+        train_set = WithSearchClips(train_set, search_set, search_cfg.batch_size)
+        loader_extra['collate_fn'] = collate_with_search
+
     train = torch.utils.data.DataLoader(
         train_set,
         **cfg.loader,
         generator=rnd_gen,
+        **loader_extra,
     )
     val_cfg = {**cfg.loader}
     val_cfg['shuffle'] = False
