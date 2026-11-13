@@ -27,14 +27,21 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-DATASET_ARCHIVE="${DATASET_ARCHIVE:?Pass --dataset=<archive in \$SCRATCH/le-wm/cluv_data>}"
+# DATASET_SOURCE (full archive path) overrides --dataset (an archive in
+# $SCRATCH/le-wm/cluv_data).
+if [[ -n "${DATASET_SOURCE:-}" ]]; then
+  DATASET_ARCHIVE="$(basename "$DATASET_SOURCE")"
+else
+  DATASET_ARCHIVE="${DATASET_ARCHIVE:?Pass --dataset=<archive in \$SCRATCH/le-wm/cluv_data> or set DATASET_SOURCE}"
+  DATASET_SOURCE="$SCRATCH/le-wm/cluv_data/$DATASET_ARCHIVE"
+fi
 CHECKPOINT="${CHECKPOINT:?Pass --checkpoint=<weights .pt>}"
 OUTPUT_NAME="${OUTPUT_NAME:?Pass --output-name=<name>}"
 [[ "$CHECKPOINT" == /* ]] || CHECKPOINT="$SCRATCH/le-wm/checkpoints/$CHECKPOINT"
 [[ -e "$CHECKPOINT" ]] || { echo "checkpoint not found: $CHECKPOINT" >&2; exit 1; }
 
 mkdir -p "$SLURM_TMPDIR/datasets" "$SCRATCH/le-wm/onpolicy"
-tar -xf "$SCRATCH/le-wm/cluv_data/$DATASET_ARCHIVE" -C "$SLURM_TMPDIR/datasets"
+tar -xf "$DATASET_SOURCE" -C "$SLURM_TMPDIR/datasets"
 
 export HF_HOME="$SCRATCH/huggingface"
 export TORCH_HOME="$SCRATCH/torch_cache"
@@ -42,9 +49,33 @@ export STABLEWM_HOME="$SCRATCH/le-wm"
 # ManiSkill renders with Vulkan; reuse the mani-exps runtime when present.
 VULKAN_LIBS="${MANI_EXPS_DIR:-$HOME/git/mani-exps}/.local-vulkan/usr/lib/x86_64-linux-gnu"
 [[ -d "$VULKAN_LIBS" ]] && export LD_LIBRARY_PATH="$VULKAN_LIBS:${LD_LIBRARY_PATH:-}"
-export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
+# The NVIDIA ICD file name differs between clusters (Mila: nvidia_icd.json,
+# rorqual: nvidia_icd.x86_64.json); otherwise leave discovery to the loader.
+if [[ -z "${VK_ICD_FILENAMES:-}" ]]; then
+  for f in /usr/share/vulkan/icd.d/nvidia_icd.json /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json; do
+    [[ -e "$f" ]] && { export VK_ICD_FILENAMES="$f"; break; }
+  done
+fi
 
-uv run --extra train --extra data --extra maniskill python scripts/train/collect_onpolicy.py \
+# Python: a prebuilt venv (Mila's plain-sbatch way: VENV_TAR, a tar holding a
+# top-level .swm/ extracted to local disk, or VENV_PATH) or the uv project env.
+if [[ -n "${VENV_TAR:-}" || -n "${VENV_PATH:-}" ]]; then
+  if command -v module >/dev/null 2>&1; then
+    module load cuda/12.6.0/cudnn/9.3 anaconda/3 || true
+  fi
+  if [[ -n "${VENV_TAR:-}" ]]; then
+    tar -xf "$VENV_TAR" -C "$SLURM_TMPDIR"
+    VENV_PATH="$SLURM_TMPDIR/.swm"
+  fi
+  source "$VENV_PATH/bin/activate"
+  # activate hardcodes the original venv path; point PATH at the copy in use.
+  export VIRTUAL_ENV="$VENV_PATH" PATH="$VENV_PATH/bin:$PATH"
+  PY=(python)
+else
+  PY=(uv run --extra train --extra data --extra maniskill python)
+fi
+
+"${PY[@]}" scripts/train/collect_onpolicy.py \
   --checkpoint "$CHECKPOINT" \
   --dataset "${DATASET_ARCHIVE%.tar.gz}" \
   --cache-dir "$SLURM_TMPDIR" \

@@ -41,7 +41,14 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-DATASET_ARCHIVE="${DATASET_ARCHIVE:?Pass --dataset=<archive in \$SCRATCH/le-wm/cluv_data>}"
+# DATASET_SOURCE (full archive path) overrides --dataset (an archive in
+# $SCRATCH/le-wm/cluv_data).
+if [[ -n "${DATASET_SOURCE:-}" ]]; then
+  DATASET_ARCHIVE="$(basename "$DATASET_SOURCE")"
+else
+  DATASET_ARCHIVE="${DATASET_ARCHIVE:?Pass --dataset=<archive in \$SCRATCH/le-wm/cluv_data> or set DATASET_SOURCE}"
+  DATASET_SOURCE="$SCRATCH/le-wm/cluv_data/$DATASET_ARCHIVE"
+fi
 INIT_FROM="${INIT_FROM:?Pass --init-from=<weights .pt>}"
 NAME="${NAME:?Pass --name=<run name>}"
 [[ "$INIT_FROM" == /* ]] || INIT_FROM="$SCRATCH/le-wm/checkpoints/$INIT_FROM"
@@ -51,7 +58,7 @@ CKPT_ROOT="$SCRATCH/le-wm/checkpoints"
 DATA_ROOT="$SCRATCH/le-wm/onpolicy"
 
 mkdir -p "$SLURM_TMPDIR/datasets" "$DATA_ROOT"
-tar -xf "$SCRATCH/le-wm/cluv_data/$DATASET_ARCHIVE" -C "$SLURM_TMPDIR/datasets"
+tar -xf "$DATASET_SOURCE" -C "$SLURM_TMPDIR/datasets"
 DATASET_NAME="${DATASET_ARCHIVE%.tar.gz}"
 
 export LOCAL_DATASET_DIR="$SLURM_TMPDIR"
@@ -63,9 +70,31 @@ export STABLEWM_HOME="$SCRATCH/le-wm"
 # ManiSkill renders with Vulkan; reuse the mani-exps runtime when present.
 VULKAN_LIBS="${MANI_EXPS_DIR:-$HOME/git/mani-exps}/.local-vulkan/usr/lib/x86_64-linux-gnu"
 [[ -d "$VULKAN_LIBS" ]] && export LD_LIBRARY_PATH="$VULKAN_LIBS:${LD_LIBRARY_PATH:-}"
-export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
+# The NVIDIA ICD file name differs between clusters (Mila: nvidia_icd.json,
+# rorqual: nvidia_icd.x86_64.json); otherwise leave discovery to the loader.
+if [[ -z "${VK_ICD_FILENAMES:-}" ]]; then
+  for f in /usr/share/vulkan/icd.d/nvidia_icd.json /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json; do
+    [[ -e "$f" ]] && { export VK_ICD_FILENAMES="$f"; break; }
+  done
+fi
 
-UV=(uv run --extra train --extra data --extra maniskill)
+# Python: a prebuilt venv (Mila's plain-sbatch way: VENV_TAR, a tar holding a
+# top-level .swm/ extracted to local disk, or VENV_PATH) or the uv project env.
+if [[ -n "${VENV_TAR:-}" || -n "${VENV_PATH:-}" ]]; then
+  if command -v module >/dev/null 2>&1; then
+    module load cuda/12.6.0/cudnn/9.3 anaconda/3 || true
+  fi
+  if [[ -n "${VENV_TAR:-}" ]]; then
+    tar -xf "$VENV_TAR" -C "$SLURM_TMPDIR"
+    VENV_PATH="$SLURM_TMPDIR/.swm"
+  fi
+  source "$VENV_PATH/bin/activate"
+  # activate hardcodes the original venv path; point PATH at the copy in use.
+  export VIRTUAL_ENV="$VENV_PATH" PATH="$VENV_PATH/bin:$PATH"
+  PY=(python)
+else
+  PY=(uv run --extra train --extra data --extra maniskill python)
+fi
 stamp() { date +%Y%m%d-%H%M%S; }
 
 model="$INIT_FROM"
@@ -81,7 +110,7 @@ for r in $(seq 1 "$ROUNDS"); do
     tmp="$DATA_ROOT/${NAME}_r${r}_tmp.lance"
     [[ -e "$tmp" ]] && mv "$tmp" "$DATA_ROOT/${NAME}_r${r}_partial_$(stamp).lance"
     echo "round $r: collecting with $model"
-    "${UV[@]}" python scripts/train/collect_onpolicy.py \
+    "${PY[@]}" scripts/train/collect_onpolicy.py \
       --checkpoint "$model" --dataset "$DATASET_NAME" --cache-dir "$SLURM_TMPDIR" \
       --output "$tmp" --num-clips "$NUM_CLIPS" --seed "$r"
     mv "${tmp%.lance}.collection.json" "${data%.lance}.collection.json"
@@ -94,7 +123,7 @@ for r in $(seq 1 "$ROUNDS"); do
   else
     [[ -e "$CKPT_ROOT/$run" ]] && mv "$CKPT_ROOT/$run" "$CKPT_ROOT/${run}_partial_$(stamp)"
     echo "round $r: training $STEPS steps on dataset + [$collected]"
-    "${UV[@]}" python scripts/train/lewm.py \
+    "${PY[@]}" scripts/train/lewm.py \
       --config-name=lewm_onpolicy \
       init_from="$model" \
       data=maniskill_vision \
