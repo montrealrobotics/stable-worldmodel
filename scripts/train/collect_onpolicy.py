@@ -58,6 +58,11 @@ def parse_args():
     p.add_argument('--env-id', default='OverheadPushT-v1')
     p.add_argument('--camera', default='overhead_camera')
     p.add_argument('--control-mode', default='pd_ee_delta_xy')
+    p.add_argument(
+        '--sim-backend',
+        default='physx_cuda',
+        help='physx_cpu: deterministic per env (slow); for --verify checks',
+    )
     p.add_argument('--jpeg-quality', type=int, default=95)
     p.add_argument(
         '--verify',
@@ -131,7 +136,7 @@ def make_env(args, num_envs):
         args.env_id,
         num_envs=num_envs,
         obs_mode='rgb',
-        sim_backend='physx_cuda',
+        sim_backend=args.sim_backend,
         control_mode=args.control_mode,
         reconfiguration_freq=0,
         sensor_configs={'width': 128, 'height': 128},
