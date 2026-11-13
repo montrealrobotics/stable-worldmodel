@@ -150,21 +150,59 @@ def pick(plans, n, start, count, gen):
     return plans[torch.arange(B, device=plans.device)[:, None], idx], idx
 
 
-def verify(frames, states, clip_pixels, clip_states, H, M, B):
-    """Print how far expert replays drift from the recorded clip, per block:
-    mean pixel error and the max / mean abs error of the flat sim state.
-    Block 0 tests the restore alone; later blocks also test that replaying
-    the recorded actions (normalized and back) reproduces the dataset.
+def task_pose(base, flat):
+    """T xy, T yaw and TCP xy of flat sim states (loads them into the env)."""
+    from stable_worldmodel.envs.maniskill.chunks import snapshot
+
+    base.set_state(flat)
+    s = snapshot(base)
+    return s['tee_xy'], s['tee_yaw'], s['tcp_xy']
+
+
+def pose_errors(a, b):
+    """Per-env (T mm, T yaw deg, TCP mm) between two task_pose results."""
+    from stable_worldmodel.envs.maniskill.chunks import wrap
+
+    return (
+        1e3 * (a[0] - b[0]).norm(dim=-1),
+        torch.rad2deg(wrap(a[1] - b[1]).abs()),
+        1e3 * (a[2] - b[2]).norm(dim=-1),
+    )
+
+
+def verify(base, frames, states, clip_pixels, clip_states, H, M, B):
+    """Expert replays from restored states vs the recorded clip, per block.
+
+    dataset gap: each replay vs the dataset (T position mm, T yaw deg, TCP
+    mm, pixel MAE). copy spread: the M identical replays of a clip vs the
+    first one, i.e. the simulator's own run-to-run non-determinism. A gap
+    close to the spread means the drift is physics, not a bug.
+    Block 0 tests the restore alone.
     """
     sim_px = torch.stack(frames, 1).permute(0, 1, 4, 2, 3).float()
     sim_st = torch.stack(states, 1).float()
     ref_px = clip_pixels[:, H - 1 :].float().repeat_interleave(M, 0)
     ref_st = clip_states[:, H - 1 :].repeat_interleave(M, 0)
-    print('block | pixel MAE (0-255) | state max |diff| | state mean |diff|')
-    for k in range(sim_px.size(1)):
+    print(
+        'block |  dataset gap: T mm (mean/max)  yaw deg (mean/max)  TCP mm  px MAE'
+        ' |  copy spread: T mm (mean/max)  yaw deg (mean/max)  TCP mm'
+    )
+    for k in range(sim_st.size(1)):
+        sim = task_pose(base, sim_st[:, k])
+        ref = task_pose(base, ref_st[:, k])
+        gap = pose_errors(sim, ref)
+        first = [v.view(B, M, *v.shape[1:])[:, :1].expand(B, M, *v.shape[1:])
+                 .reshape(v.shape) for v in sim]
+        spread = [e.view(B, M)[:, 1:] for e in pose_errors(sim, first)]
         px = (sim_px[:, k] - ref_px[:, k]).abs().mean().item()
-        st = (sim_st[:, k] - ref_st[:, k]).abs()
-        print(f'{k:5d} | {px:17.2f} | {st.max().item():16.4f} | {st.mean().item():.5f}')
+        print(
+            f'{k:5d} |  {gap[0].mean():6.2f} / {gap[0].max():6.2f}'
+            f'     {gap[1].mean():6.2f} / {gap[1].max():6.2f}'
+            f'      {gap[2].mean():6.2f}  {px:6.2f}'
+            f' |  {spread[0].mean():6.2f} / {spread[0].max():6.2f}'
+            f'     {spread[1].mean():6.2f} / {spread[1].max():6.2f}'
+            f'      {spread[2].mean():6.2f}'
+        )
     print(f'{B} clips x {M} identical replays; block 0 checks the restore only')
 
 
@@ -248,7 +286,7 @@ def main():
                 states.append(base.get_state().clone())
 
             if args.verify:
-                verify(frames, states, clip_pixels, clip_states, H, M, B)
+                verify(base, frames, states, clip_pixels, clip_states, H, M, B)
                 return
             frames = torch.stack(frames, 1).cpu().numpy()  # (N, T+1, h, w, 3)
             states = torch.stack(states, 1).float().cpu().numpy()
