@@ -9,6 +9,10 @@ in the dataset, and replays their recorded actions open loop:
   B       same seeds and slots, but restore the recorded state (and
           controller target) at step --restore-step and replay from there:
           what a mid-episode restore loses (solver warm start etc.).
+  C1, C2  rebuild the scene (reconfigure reset), then restore as in B; twice.
+          C2 == C1 means rebuilt-then-restored rollouts are reproducible.
+  D       rebuild, then restore one clip into every slot with its actions:
+          do identical rollouts in different slots agree?
   --save / --compare: A1 of two separate processes, each in a fresh sim.
           Bit-exact means the GPU sim is deterministic and A2 vs A1 drift
           comes from solver state carried over from the previous run.
@@ -92,11 +96,12 @@ def pick_batch(meta, which):
     return seed, [batches[seed][s] for s in range(n)]
 
 
-def replay(env, seeds, actions, lengths, restore=None):
+def replay(env, seeds, actions, lengths, restore=None, reconfigure=False):
     """Recorded actions open loop; returns states (T + 1, N, D), NaN before
-    the start. restore = (t0, states, targets) restores the slots at t0."""
+    the start. restore = (t0, states, targets) restores the slots at t0.
+    reconfigure rebuilds the scene first, i.e. a fresh PhysX GPU system."""
     base = env.unwrapped
-    env.reset(seed=seeds)
+    env.reset(seed=seeds, options={'reconfigure': True} if reconfigure else None)
     t0 = 0
     if restore is not None:
         t0, states, targets = restore
@@ -183,6 +188,19 @@ def main():
         'A2': replay(env, seeds, actions, lengths),
         'B': replay(env, seeds, actions, lengths, (t0, start_states, targets)),
     }
+    # Test B: rebuild the scene before restoring (what the collector would do).
+    restore = (t0, start_states, targets)
+    runs['C1'] = replay(env, seeds, actions, lengths, restore, reconfigure=True)
+    runs['C2'] = replay(env, seeds, actions, lengths, restore, reconfigure=True)
+    # D: one clip restored into all slots with the same actions (slot effects).
+    s0 = int(lengths.argmax())
+    same = (
+        t0,
+        start_states[s0].expand(n, -1).contiguous(),
+        targets[s0].expand(n, -1).contiguous(),
+    )
+    actions_d = actions[:, s0 : s0 + 1].expand(-1, n, -1).contiguous()
+    runs['D'] = replay(env, seeds, actions_d, lengths, same, reconfigure=True)
     steps = torch.arange(T + 1, device=device)[:, None]
     valid = steps < lengths[None]  # recorded steps only
     poses = {k: decode(base, v) for k, v in runs.items()}
@@ -194,6 +212,17 @@ def main():
             poses['B'], ref_pose, runs['B'], ref, valid & (steps >= t0)
         ),
     }
+    table[f'C2 vs C1 (reconfigure + restore @{t0}, twice)'] = errors(
+        poses['C2'], poses['C1'], runs['C2'], runs['C1'], valid & (steps >= t0)
+    )
+    table['C1 vs dataset'] = errors(
+        poses['C1'], ref_pose, runs['C1'], ref, valid & (steps >= t0)
+    )
+    first = [x[:, :1] for x in poses['D']]
+    valid_d = ((steps >= t0) & (steps < lengths[s0])).expand(-1, n)
+    table[f'D: slot {s0} clip in all {n} slots, each vs slot 0'] = errors(
+        poses['D'], first, runs['D'], runs['D'][:, :1], valid_d
+    )
     if args.compare is not None:
         other = torch.load(args.compare).to(device)
         table['A1 vs A1 of another fresh process'] = errors(
