@@ -188,9 +188,10 @@ sbatch_args = { account = "aip-gberseth" }
 sbatch_args = { account = "aip-gberseth" }
 
 [tool.cluv.clusters.rorqual]
-# With more than one allocation on a cluster, `cluv submit rorqual` submits one job per allocation
-# and keeps the first one that starts, cancelling the others.
-sbatch_args = [{ account = "rrg-gberseth" }, { account = "def-gberseth" }]
+# One allocation only: with several, `cluv submit` submits one job per allocation and keeps
+# running until one starts (to cancel the others). rrg has the higher priority; pass
+# --account=def-gberseth to use the other one.
+sbatch_args = { account = "rrg-gberseth" }
 
 [tool.cluv.clusters.fir]
 env = { UV_OFFLINE = "0", WANDB_MODE = "online" }
