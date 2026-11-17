@@ -524,7 +524,7 @@ def lejepa_forward(self, batch, stage, cfg):
     if window:  # TC-LeWM: regularize residuals around the local temporal mean
         # Keeps every loaded frame: they are loaded to fill the window.
         reg_emb = temporal_center(reg_emb, window)
-    else:
+    elif not cfg.loss.sigreg.get('all_frames', False):
         # The frames the prediction loss uses, not extra frames loaded for
         # the search loss (lewm_search clips hold history + horizon).
         reg_emb = reg_emb[:, : ctx_len + n_preds]

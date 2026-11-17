@@ -240,9 +240,11 @@ def test_search_on_main_clips(search_loss):
     assert 'search_loss' not in val
 
 
-def test_sigreg_on_prediction_frames(search_loss):
+@pytest.mark.parametrize('all_frames', [None, False, True])
+def test_sigreg_on_prediction_frames(search_loss, all_frames):
     """Post-training clips hold history + horizon frames; SIGReg sees only the
-    history + num_preds frames the prediction loss uses."""
+    history + num_preds frames the prediction loss uses, or every loaded frame
+    with sigreg.all_frames."""
     from types import SimpleNamespace
 
     g = search_loss.__globals__
@@ -254,6 +256,8 @@ def test_sigreg_on_prediction_frames(search_loss):
             'loss': {'sigreg': {'weight': 0.5}},
         }
     )
+    if all_frames is not None:  # None: key absent (older configs)
+        cfg.loss.sigreg.all_frames = all_frames
     model = LeWMState(
         encoder=_identity(2),
         predictor=_Predictor(),
@@ -268,6 +272,7 @@ def test_sigreg_on_prediction_frames(search_loss):
     out = g['lejepa_forward'](module, {'state': state, 'action': action}, 'fit', cfg)
     emb = out['emb']
     assert emb.shape[1] == H + T
+    frames = H + T if all_frames else H + 1
     torch.testing.assert_close(
-        out['sigreg_loss'], sigreg(emb[:, : H + 1].transpose(0, 1))
+        out['sigreg_loss'], sigreg(emb[:, :frames].transpose(0, 1))
     )

@@ -112,6 +112,11 @@ loss:
     # (null = standard SIGReg; the paper centers over the full 4-frame clip).
     # num_steps is raised to at least this; SIGReg sees all loaded frames.
     temporal_window: null
+    # false: SIGReg sees only the history + num_preds frames the prediction
+    # loss uses. true: every loaded frame, as search post-training did before
+    # 2026-11-16 (lewm_search clips hold history + horizon frames).
+    # temporal_window always uses every loaded frame.
+    all_frames: false
     kwargs:
       knots: 17
       num_proj: 1024
