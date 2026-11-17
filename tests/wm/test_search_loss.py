@@ -163,3 +163,111 @@ def test_uint8_pixels_match_float_preprocessing():
     fast, slow = run(True)['pixels'], run(False)['pixels']
     assert fast.dtype == slow.dtype == torch.float32
     torch.testing.assert_close(fast, slow)
+
+
+def test_search_on_main_clips(search_loss):
+    """main_clips: MSE + SIGReg on the trimmed clips, InfoNCE on the first
+    search.batch_size clips of the same batch with all their frames."""
+    from types import SimpleNamespace
+
+    g = search_loss.__globals__
+    H, T, B, N = 1, 3, 5, 3
+    cfg = OmegaConf.create(
+        {
+            'wm': {'history_size': H, 'num_preds': 1},
+            'gradient_diagnostics_interval': 0,
+            'loss': {
+                'sigreg': {'weight': 0.5},
+                'search': {
+                    'weight': 0.1,
+                    'horizon': T,
+                    'bptt': True,
+                    'cem_steps': 2,
+                    'num_samples': 8,
+                    'topk': 3,
+                    'num_perturbed': 4,
+                    'perturb_std': 0.5,
+                    'var_scale': 1.0,
+                    'temperature': 1.0,
+                    'batch_size': N,
+                    'main_clips': True,
+                },
+            },
+        }
+    )
+    model = LeWMState(
+        encoder=_identity(2),
+        predictor=_Predictor(),
+        action_encoder=_identity(2),
+    )
+    sigreg = lambda x: x.pow(2).mean()  # noqa: E731
+    module = SimpleNamespace(
+        model=model, sigreg=sigreg, log_dict=lambda *a, **k: None, global_step=1
+    )
+    torch.manual_seed(0)
+    state = torch.randn(B, H + T, 2)
+    action = torch.randn(B, H + T, 2)
+
+    torch.manual_seed(1)
+    out = g['lejepa_forward'](
+        module, {'state': state.clone(), 'action': action.clone()}, 'fit', cfg
+    )
+
+    # MSE + SIGReg: base objective on the first H + 1 frames of every clip.
+    short = model.encode({'state': state[:, : H + 1], 'action': action[:, : H + 1]})
+    emb = short['emb']
+    pred = model.predict({'emb': emb[:, :H], 'act_emb': short['act_emb'][:, :H]})
+    torch.testing.assert_close(
+        out['pred_loss'], (pred['preds'] - emb[:, 1 : 1 + H]).pow(2).mean()
+    )
+    torch.testing.assert_close(out['sigreg_loss'], sigreg(emb.transpose(0, 1)))
+    assert out['emb'].shape[:2] == (B, H + 1)
+
+    # InfoNCE: first N clips of the same batch, all frames.
+    torch.manual_seed(1)
+    sub = model.encode({'state': state[:N], 'action': action[:N]})
+    expected = search_loss(model, sub, sub['emb'], cfg)
+    torch.testing.assert_close(out['search_loss'], expected)
+    torch.testing.assert_close(
+        out['loss'],
+        out['pred_loss'] + 0.5 * out['sigreg_loss'] + 0.1 * expected,
+    )
+
+    # Validation: no search loss.
+    val = g['lejepa_forward'](
+        module, {'state': state.clone(), 'action': action.clone()}, 'validate', cfg
+    )
+    assert 'search_loss' not in val
+
+
+def test_sigreg_on_prediction_frames(search_loss):
+    """Post-training clips hold history + horizon frames; SIGReg sees only the
+    history + num_preds frames the prediction loss uses."""
+    from types import SimpleNamespace
+
+    g = search_loss.__globals__
+    H, T, B = 1, 3, 4
+    cfg = OmegaConf.create(
+        {
+            'wm': {'history_size': H, 'num_preds': 1},
+            'gradient_diagnostics_interval': 0,
+            'loss': {'sigreg': {'weight': 0.5}},
+        }
+    )
+    model = LeWMState(
+        encoder=_identity(2),
+        predictor=_Predictor(),
+        action_encoder=_identity(2),
+    )
+    sigreg = lambda x: x.pow(2).mean()  # noqa: E731
+    module = SimpleNamespace(
+        model=model, sigreg=sigreg, log_dict=lambda *a, **k: None, global_step=1
+    )
+    state = torch.randn(B, H + T, 2)
+    action = torch.randn(B, H + T, 2)
+    out = g['lejepa_forward'](module, {'state': state, 'action': action}, 'fit', cfg)
+    emb = out['emb']
+    assert emb.shape[1] == H + T
+    torch.testing.assert_close(
+        out['sigreg_loss'], sigreg(emb[:, : H + 1].transpose(0, 1))
+    )

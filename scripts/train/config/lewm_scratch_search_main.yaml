@@ -1,0 +1,20 @@
+# Search InfoNCE from scratch on the main batch. Like lewm_scratch_search, but
+# the InfoNCE uses the first search.batch_size clips of the main batch itself
+# instead of an independent sample (main_clips). Main clips are loaded with
+# history + horizon frames; MSE + SIGReg still see only the first
+# history + num_preds frames of each clip, as in the base run.
+defaults:
+  - lewm_scratch_search
+  - _self_
+
+output_model_name: lewm_scratch_search_main
+
+data:
+  dataset:
+    num_steps: ${eval:'${wm.history_size} + ${loss.search.horizon}'}
+
+loss:
+  search:
+    batch_size: 256 # first N clips of each main batch get the InfoNCE
+    separate_clips: false
+    main_clips: true

@@ -161,6 +161,22 @@ class SaveCkptCallback(Callback):
             )
 
 
+def slice_clips(batch, frames=None, clips=None):
+    """New dict: the first ``frames`` time steps of the first ``clips`` clips.
+
+    Tensors with a time axis (ndim > 1) are cut in time; 1-D tensors only
+    in clips. The input dict is left as is (``encode`` writes into it).
+    """
+    out = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v) and v.ndim > 0:
+            v = v[:clips]
+            if v.ndim > 1:
+                v = v[:, :frames]
+        out[k] = v
+    return out
+
+
 def search_batch(batch, emb, cfg):
     """Check the clip length and keep the first ``search.batch_size`` clips."""
     H, search = cfg.wm.history_size, cfg.loss.search
@@ -469,10 +485,20 @@ def lejepa_forward(self, batch, stage, cfg):
         progress = self.global_step / total
     lambd = sigreg_weight(cfg.loss.sigreg, progress)
 
+    search = getattr(cfg.loss, 'search', None)
+    use_search_loss = bool(search) and search.weight > 0
+    main_clips = use_search_loss and search.get('main_clips', False)
     search_clips = batch.pop('search', None)  # see WithSearchClips
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
     normalize_pixels(batch)
+
+    # main_clips: clips hold history + horizon frames for the search loss, but
+    # MSE and SIGReg need only history + num_preds: encode just those for the
+    # whole batch, and all frames only for the search clips.
+    if main_clips:
+        full_batch = batch
+        batch = slice_clips(full_batch, frames=ctx_len + n_preds)
 
     output = self.model.encode(batch)
 
@@ -496,7 +522,12 @@ def lejepa_forward(self, batch, stage, cfg):
     reg_emb = output.get('cls_emb', emb)
     window = cfg.loss.sigreg.get('temporal_window')
     if window:  # TC-LeWM: regularize residuals around the local temporal mean
+        # Keeps every loaded frame: they are loaded to fill the window.
         reg_emb = temporal_center(reg_emb, window)
+    else:
+        # The frames the prediction loss uses, not extra frames loaded for
+        # the search loss (lewm_search clips hold history + horizon).
+        reg_emb = reg_emb[:, : ctx_len + n_preds]
     output['sigreg_loss'] = self.sigreg(reg_emb.transpose(0, 1))
     output['loss'] = output['pred_loss'] + lambd * output['sigreg_loss']
     aux_yaw = cfg.loss.get('aux_yaw') or {}
@@ -506,9 +537,8 @@ def lejepa_forward(self, batch, stage, cfg):
         target = torch.stack([yaw.sin(), yaw.cos()], -1)  # (B, T, 2)
         output['aux_yaw_loss'] = F.mse_loss(self.aux_head(emb), target)
         output['loss'] = output['loss'] + aux_yaw.weight * output['aux_yaw_loss']
-    search = getattr(cfg.loss, 'search', None)
     gfn_logs = {}
-    if search and search.weight > 0 and search.get('sampler', 'cem') == 'gfn':
+    if use_search_loss and search.get('sampler', 'cem') == 'gfn':
         step = self.trainer.fit_loop.total_batch_idx  # batches, not opt steps
         if stage == 'fit':
             gfn_extra_policy_steps(self, batch, emb, cfg, step)
@@ -523,7 +553,17 @@ def lejepa_forward(self, batch, stage, cfg):
             + search.weight * output['search_loss']
             + output['gfn_tb_loss']
         )
-    elif search and search.weight > 0 and search.get('separate_clips'):
+    elif main_clips:
+        # The first search.batch_size clips of this same (shuffled) batch, all
+        # frames; training only, like separate_clips.
+        if stage == 'fit':
+            sub = slice_clips(full_batch, clips=search.get('batch_size'))
+            s_emb = self.model.encode(sub)['emb']
+            output['search_loss'] = search_loss(self.model, sub, s_emb, cfg)
+            output['loss'] = (
+                output['loss'] + search.weight * output['search_loss']
+            )
+    elif use_search_loss and search.get('separate_clips'):
         # Own longer clips (training only; validation batches carry none).
         if search_clips is not None:
             search_clips['action'] = torch.nan_to_num(search_clips['action'], 0.0)
@@ -535,7 +575,7 @@ def lejepa_forward(self, batch, stage, cfg):
             output['loss'] = (
                 output['loss'] + search.weight * output['search_loss']
             )
-    elif search and search.weight > 0:
+    elif use_search_loss:
         output['search_loss'] = search_loss(self.model, batch, emb, cfg)
         output['loss'] = output['loss'] + search.weight * output['search_loss']
 
@@ -564,7 +604,7 @@ def lejepa_forward(self, batch, stage, cfg):
                 self.model.encoder.parameters(),
                 lambd,
                 search_loss=output.get('search_loss'),
-                search_weight=search.weight if search else 0.0,
+                search_weight=search.weight if use_search_loss else 0.0,
             )
             self.log_dict(
                 {f'{stage}/{k}': v for k, v in diagnostics.items()},
@@ -735,6 +775,8 @@ def run(cfg):
     # of history + horizon frames for the InfoNCE.
     search_cfg = cfg.loss.get('search') or {}
     loader_extra = {}
+    if search_cfg.get('main_clips') and search_cfg.get('separate_clips'):
+        raise ValueError('use either loss.search.main_clips or separate_clips')
     if search_cfg.get('weight', 0) > 0 and search_cfg.get('separate_clips'):
         from stable_worldmodel.data.mixing import (
             WithSearchClips,
