@@ -16,6 +16,10 @@ Only low-dimensional columns are read (no pixel decoding). Per frame:
   dynamics   T speed, T yaw rate, TCP speed per step (finite differences)
   action     action dims (2D density of the first two)
   qpos       per-joint marginals                    obs_agent_qpos
+  transition s_t -> s_t+1 (aligned with action_t): T step in the T frame, and
+             push maps over the pusher position in the T frame: mean T step
+             (arrows) and how many pusher-motion directions the data holds
+             per position (action diversity per state)
 
 Coverage metrics per 2D space (support = bins any group visits):
   coverage     fraction of support bins the group visits (>=1 frame)
@@ -74,6 +78,9 @@ SPACES = {
     'start_tee_xy': ('start_tee_x', 'start_tee_y', 'Start T xy (mm)'),
     'start_eef_xy': ('start_eef_x', 'start_eef_y', 'Start TCP xy (mm)'),
     'action_01': ('action_0', 'action_1', 'Action dims 0 vs 1'),
+    # Transitions (s_t -> s_t+1): the T's step in its own frame at t.
+    'tee_step': ('tee_step_x', 'tee_step_y', 'T step s_t->s_t+1, T frame (mm)'),
+    'tee_step_mag_yaw': ('tee_step_mag', 'tee_step_yaw', 'T step |dxy| (mm) vs dyaw (deg)'),
 }
 
 FIGURES = {
@@ -81,7 +88,12 @@ FIGURES = {
     'orientation': ['tee_x_yaw', 'tee_y_yaw', 'goal_yaw_vs_tee_yaw'],
     'relative': ['contact_xy', 'eef_minus_tee', 'task_offset', 'task_dist_yawerr'],
     'actions': ['action_01'],
+    'transitions': ['tee_step', 'tee_step_mag_yaw'],
 }
+
+# Push maps: pusher position in the T frame on a zoomed grid around the T.
+PUSH_HALF_MM, PUSH_CELLS, PUSH_DIRS = 150.0, 30, 16
+PUSH_MOVE_MM = 1.0  # pusher moves at least this much per step to count a direction
 
 ANGULAR = {'tee_yaw', 'goal_yaw', 'task_yaw_err', 'start_tee_yaw', 'tee_yaw_rate'}
 
@@ -223,6 +235,27 @@ def features(d):
     if 'eef_x' in f:
         f['eef_speed'] = np.hypot(step_diff(f['eef_x']), step_diff(f['eef_y']))
 
+    # Forward differences s_t+1 - s_t, aligned with action_t (NaN on the last frame).
+    last = np.r_[ep[1:] != ep[:-1], True]
+
+    def next_diff(x, angular=False):
+        dx = np.r_[np.diff(x), np.nan]
+        if angular:
+            dx = np.degrees(wrap(np.radians(dx)))
+        dx[last] = np.nan
+        return dx
+
+    if 'tee_x' in f:
+        yaw = np.radians(f['tee_yaw'])
+        c, s = np.cos(yaw), np.sin(yaw)
+        dx, dy = next_diff(f['tee_x']), next_diff(f['tee_y'])
+        f['tee_step_x'], f['tee_step_y'] = c * dx + s * dy, -s * dx + c * dy
+        f['tee_step_mag'] = np.hypot(dx, dy)
+        f['tee_step_yaw'] = next_diff(f['tee_yaw'], angular=True)
+        if 'eef_x' in f:
+            ex, ey = next_diff(f['eef_x']), next_diff(f['eef_y'])
+            f['push_x'], f['push_y'] = c * ex + s * ey, -s * ex + c * ey
+
     # Episode-start features, repeated per frame only at the first frame (NaN elsewhere).
     for k in ('tee_x', 'tee_y', 'tee_yaw', 'eef_x', 'eef_y'):
         if k in f:
@@ -309,6 +342,85 @@ def plot_grid(fname, space_names, groups, hists, edges, out):
                 ax.set_ylabel(g, fontsize=9, color=INK)
         fig.colorbar(im, ax=axes[:, j], location='bottom', shrink=0.85, aspect=25, label='fraction of frames (log)')
     fig.savefig(out / f'{fname}.png', dpi=130)
+    plt.close(fig)
+
+
+def push_maps(f, k):
+    """Per pusher-in-T-frame cell: frames, mean T step (T frame), and pusher-direction diversity.
+
+    Directions are the pusher's own motion s_t -> s_t+1 in the T frame, binned
+    into PUSH_DIRS sectors; a direction counts when >= k frames move that way.
+    """
+    e = np.linspace(-PUSH_HALF_MM, PUSH_HALF_MM, PUSH_CELLS + 1)
+    need = ('contact_x', 'contact_y', 'tee_step_x', 'tee_step_y', 'tee_step_mag', 'push_x', 'push_y')
+    if not all(n in f for n in need):
+        return None
+    x, y = f['contact_x'], f['contact_y']
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(f['tee_step_x']) & np.isfinite(f['push_x'])
+    x, y = x[ok], y[ok]
+    count = np.histogram2d(x, y, bins=(e, e))[0]
+    sums = {n: np.histogram2d(x, y, bins=(e, e), weights=f[n][ok])[0] for n in ('tee_step_x', 'tee_step_y', 'tee_step_mag')}
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mean = {n: v / count for n, v in sums.items()}
+    moving = np.hypot(f['push_x'][ok], f['push_y'][ok]) > PUSH_MOVE_MM
+    ang = np.arctan2(f['push_y'][ok], f['push_x'][ok])
+    ea = np.linspace(-np.pi, np.pi, PUSH_DIRS + 1)
+    cube = np.histogramdd(np.stack([x[moving], y[moving], ang[moving]], 1), bins=(e, e, ea))[0]
+    dirs = (cube >= k).sum(-1).astype(float)
+    p = cube / np.maximum(cube.sum(-1, keepdims=True), 1)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        dir_ent = -(np.where(p > 0, p * np.log(p), 0)).sum(-1) / math.log(PUSH_DIRS)
+    return {'edges': e, 'count': count, 'mean': mean, 'dirs': dirs, 'dir_entropy': dir_ent, 'moving_count': cube.sum(-1)}
+
+
+def push_metrics(m, k):
+    """Summaries over cells where the pusher is near the T (>= k frames) and over contact cells (T moves)."""
+    cells = m['count'] >= k
+    contact = cells & (np.nan_to_num(m['mean']['tee_step_mag']) > 1.0)
+    w = m['moving_count']
+    out = {}
+    for name, mask in (('near', cells), ('contact', contact)):
+        ww = w[mask]
+        out[f'{name}_cells'] = int(mask.sum())
+        out[f'{name}_dirs_mean'] = float((m['dirs'][mask] * ww).sum() / max(ww.sum(), 1))
+        out[f'{name}_dir_entropy'] = float((np.nan_to_num(m['dir_entropy'][mask]) * ww).sum() / max(ww.sum(), 1))
+        out[f'{name}_frac_cells_ge8dirs'] = float((m['dirs'][mask] >= 8).mean()) if mask.any() else 0.0
+    return out
+
+
+def plot_push(groups, maps, out):
+    groups = [g for g in groups if maps.get(g) is not None]
+    if not groups:
+        return
+    nr = len(groups)
+    fig, axes = plt.subplots(nr, 2, figsize=(7.2, 3.3 * nr + 0.8), squeeze=False, constrained_layout=True)
+    vals = np.concatenate([np.where(maps[g]['count'] >= 20, maps[g]['mean']['tee_step_mag'], np.nan).ravel() for g in groups])
+    vmax = float(np.nanmax(vals)) if np.isfinite(vals).any() else 1.0
+    for i, g in enumerate(groups):
+        m = maps[g]
+        e = m['edges']
+        c = 0.5 * (e[1:] + e[:-1])
+        mag = np.where(m['count'] >= 20, m['mean']['tee_step_mag'], np.nan)
+        ax = axes[i, 0]
+        im0 = ax.pcolormesh(e, e, mag.T, cmap=SEQ_CMAP, vmin=0, vmax=vmax, rasterized=True)
+        u = np.where(m['count'] >= 20, m['mean']['tee_step_x'], np.nan)
+        v = np.where(m['count'] >= 20, m['mean']['tee_step_y'], np.nan)
+        X, Y = np.meshgrid(c, c, indexing='ij')
+        ax.quiver(X, Y, u, v, color=INK, angles='xy', scale_units='xy', scale=0.25, width=0.004)
+        ax2 = axes[i, 1]
+        dirs = np.where(m['count'] >= 20, m['dirs'], np.nan)
+        im1 = ax2.pcolormesh(e, e, dirs.T, cmap=SEQ_CMAP, vmin=0, vmax=PUSH_DIRS, rasterized=True)
+        for a in (ax, ax2):
+            a.set_aspect('equal')
+            a.set_facecolor('#fcfcfb')
+            style(a)
+        ax.set_ylabel(g, fontsize=9, color=INK)
+        if i == 0:
+            ax.set_title('Mean T step by pusher position (T frame)', fontsize=9, color=INK)
+            ax2.set_title(f'Pusher directions seen (of {PUSH_DIRS})', fontsize=9, color=INK)
+    fig.colorbar(im0, ax=axes[:, 0], location='bottom', shrink=0.85, aspect=25, label='mean |T step| (mm/step); arrows = mean step x4')
+    fig.colorbar(im1, ax=axes[:, 1], location='bottom', shrink=0.85, aspect=25, label='directions with >= k frames')
+    fig.savefig(out / 'push.png', dpi=130)
     plt.close(fig)
 
 
@@ -401,8 +513,11 @@ def main():
     for fname, names in FIGURES.items():
         plot_grid(fname, names, groups, hists, edges2d, out)
     plot_marginals(feats, groups, edges1d, out)
+    maps = {g: push_maps(feats[g], args.min_count) for g in groups}
+    plot_push(groups, maps, out)
+    push = {g: push_metrics(m, args.min_count) for g, m in maps.items() if m is not None}
 
-    (out / 'metrics.json').write_text(json.dumps({'args': vars(args), 'stats': stats, 'constant': constant, 'coverage': metrics}, indent=2))
+    (out / 'metrics.json').write_text(json.dumps({'args': vars(args), 'stats': stats, 'constant': constant, 'push': push, 'coverage': metrics}, indent=2))
     k = args.min_count
     lines = ['# State density / coverage', '', '## Per-group stats', '',
              '| group | frames | episodes | mean len | T moving frac | T speed mm/step | TCP speed mm/step |', '|---|---|---|---|---|---|---|']
@@ -412,6 +527,16 @@ def main():
     if constant:
         lines += ['', '## Constant features (range < 0.01, not plotted)', '']
         lines += [f'- {n} = {v:.3f}' for n, v in constant.items()]
+    if push:
+        lines += ['', f'## Transitions: pusher-direction diversity per pusher-in-T-frame cell '
+                  f'({PUSH_CELLS}x{PUSH_CELLS} cells over +/-{PUSH_HALF_MM:.0f} mm, {PUSH_DIRS} directions, >= {k} frames)', '',
+                  'near = cells with >= k frames; contact = near cells where the mean T step > 1 mm. '
+                  'dirs = directions seen (frame-weighted mean), H = direction entropy / log(dirs total).', '',
+                  '| group | near cells | near dirs | near H | contact cells | contact dirs | contact H | contact cells >= 8 dirs |',
+                  '|---|---|---|---|---|---|---|---|']
+        for g, p in push.items():
+            lines.append(f"| {g} | {p['near_cells']} | {p['near_dirs_mean']:.1f} | {p['near_dir_entropy']:.3f} | {p['contact_cells']} | "
+                         f"{p['contact_dirs_mean']:.1f} | {p['contact_dir_entropy']:.3f} | {p['contact_frac_cells_ge8dirs']:.3f} |")
     lines += ['', f'## Coverage (shared bins; support = bins any group visits; coverage_{k} = >= {k} frames)', '']
     for s, per in metrics.items():
         m = next(iter(per.values()))['support_bins']
@@ -421,7 +546,7 @@ def main():
         lines.append('')
     (out / 'metrics.md').write_text('\n'.join(lines))
     print('\n'.join(lines))
-    print(f'wrote {out}/{{positions,orientation,relative,actions,marginals}}.png, metrics.md, metrics.json')
+    print(f'wrote {out}/{{positions,orientation,relative,actions,transitions,push,marginals}}.png, metrics.md, metrics.json')
 
 
 if __name__ == '__main__':
