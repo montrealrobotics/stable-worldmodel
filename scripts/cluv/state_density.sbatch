@@ -5,7 +5,8 @@
 #SBATCH --time=3:00:00
 
 # State-density / coverage analysis (scripts/data/state_density.py), CPU only:
-#   cluv submit rorqual scripts/cluv/state_density.sbatch --job-name=state_density -- \
+# rorqual's rrg-gberseth allocation is GPU-only, so CPU jobs need --account=def-gberseth:
+#   cluv submit rorqual scripts/cluv/state_density.sbatch --job-name=state_density --account=def-gberseth -- \
 #     --dataset=noisy=overhead_rgb_noisy_replay_100k.lance.tar.gz \
 #     --run-name=noisy_100k \
 #     --split-by replay_idx
