@@ -367,11 +367,18 @@ def main():
 
     # Shared edges per feature over the union of groups.
     all_names = sorted(set().union(*[feats[g].keys() for g in groups]))
-    edges1d = {}
+    edges1d, constant = {}, {}
     for n in all_names:
         vals = [feats[g][n] for g in groups if n in feats[g]]
-        if any(np.isfinite(v).any() for v in vals):
-            edges1d[n] = edges_for(n, vals, args.bins, args.yaw_bins, args.clip_pct)
+        if not any(np.isfinite(v).any() for v in vals):
+            continue
+        v = np.concatenate([x[np.isfinite(x)] for x in vals])
+        if v.max() - v.min() < 1e-2:  # e.g. a fixed goal or the planar TCP height
+            constant[n] = float(v.mean())
+            continue
+        edges1d[n] = edges_for(n, vals, args.bins, args.yaw_bins, args.clip_pct)
+    if constant:
+        print('constant features (not plotted):', constant)
 
     hists, edges2d, metrics = {}, {}, {}
     for s, (fx, fy, _) in SPACES.items():
@@ -395,13 +402,16 @@ def main():
         plot_grid(fname, names, groups, hists, edges2d, out)
     plot_marginals(feats, groups, edges1d, out)
 
-    (out / 'metrics.json').write_text(json.dumps({'args': vars(args), 'stats': stats, 'coverage': metrics}, indent=2))
+    (out / 'metrics.json').write_text(json.dumps({'args': vars(args), 'stats': stats, 'constant': constant, 'coverage': metrics}, indent=2))
     k = args.min_count
     lines = ['# State density / coverage', '', '## Per-group stats', '',
              '| group | frames | episodes | mean len | T moving frac | T speed mm/step | TCP speed mm/step |', '|---|---|---|---|---|---|---|']
     fmt = lambda v, p=3: '-' if v is None else f'{v:.{p}f}'  # noqa: E731
     for g, st in stats.items():
         lines.append(f"| {g} | {st['frames']:,} | {st['episodes']:,} | {st['mean_ep_len']:.1f} | {fmt(st['tee_moving_frac'])} | {fmt(st['tee_speed_mean_mm'], 2)} | {fmt(st['eef_speed_mean_mm'], 2)} |")
+    if constant:
+        lines += ['', '## Constant features (range < 0.01, not plotted)', '']
+        lines += [f'- {n} = {v:.3f}' for n, v in constant.items()]
     lines += ['', f'## Coverage (shared bins; support = bins any group visits; coverage_{k} = >= {k} frames)', '']
     for s, per in metrics.items():
         m = next(iter(per.values()))['support_bins']
