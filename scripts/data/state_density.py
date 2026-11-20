@@ -110,6 +110,7 @@ def parse_args():
     p.add_argument('--clip-pct', type=float, default=0.05, help='range = [pct, 100-pct] percentiles of the union (non-angular)')
     p.add_argument('--chunk', type=int, default=5, help='transition length K: tuples (s_t, a_t..a_t+K-1, s_t+K); 5 = training frameskip')
     p.add_argument('--moving-mm', type=float, default=0.5, help='T speed (mm/step) above which the T counts as moving')
+    p.add_argument('--moving-deg', type=float, default=0.5, help='or |T yaw rate| (deg/step) above which the T counts as moving')
     p.add_argument('--batch-size', type=int, default=65536)
     p.add_argument('--out', default='reports/state_density')
     return p.parse_args()
@@ -183,7 +184,7 @@ def wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
-def features(d, chunk=1):
+def features(d, chunk=1, moving_mm=0.5, moving_deg=0.5):
     """Per-frame physical features (mm / deg) from the raw columns."""
     f = {}
     ep = d['episode_idx']
@@ -261,6 +262,17 @@ def features(d, chunk=1):
         if 'eef_x' in f:
             ex, ey = next_diff(f['eef_x']), next_diff(f['eef_y'])
             f['push_x'], f['push_y'] = c * ex + s * ey, -s * ex + c * ey
+
+    # Contact proxy: the T translates > moving_mm or rotates > moving_deg in a step
+    # (t-1 -> t; NaN on first frames). '_' features are stats only, never binned.
+    if 'tee_speed' in f:
+        moved = (f['tee_speed'] > moving_mm) | (np.abs(f['tee_yaw_rate']) > moving_deg)
+        f['_moved'] = np.where(first, np.nan, moved.astype(np.float32))
+        # Chunk t (s_t -> s_t+K) has contact if any of its steps t+1..t+K moved the T.
+        cs = np.r_[0.0, np.cumsum(np.nan_to_num(f['_moved']))]
+        contact = np.full(n, np.nan, np.float32)
+        contact[valid] = (cs[j[valid] + 1] - cs[np.flatnonzero(valid) + 1]) > 0
+        f['_chunk_contact'] = contact
 
     # Episode-start features, repeated per frame only at the first frame (NaN elsewhere).
     for k in ('tee_x', 'tee_y', 'tee_yaw', 'eef_x', 'eef_y'):
@@ -465,7 +477,7 @@ def main():
     for spec in args.datasets:
         label, path = spec.split('=', 1)
         data, ep_table = load(path, args.episode_stride, args.batch_size)
-        f = features(data, args.chunk)
+        f = features(data, args.chunk, args.moving_mm, args.moving_deg)
         for g, mask in split_groups(label, data, ep_table, args.split_by):
             feats[g] = {k: v[mask] for k, v in f.items()}
             ep = data['episode_idx'][mask]
@@ -474,7 +486,9 @@ def main():
                 'frames': int(mask.sum()),
                 'episodes': int(len(np.unique(ep))),
                 'mean_ep_len': float(mask.sum() / max(len(np.unique(ep)), 1)),
-                'tee_moving_frac': float(np.nanmean(ts > args.moving_mm)) if np.isfinite(ts).any() else None,
+                'tee_moving_frac': float(np.mean(ts[np.isfinite(ts)] > args.moving_mm)) if np.isfinite(ts).any() else None,
+                'tee_moved_frac': float(np.nanmean(feats[g]['_moved'])) if '_moved' in feats[g] else None,
+                'chunk_contact_frac': float(np.nanmean(feats[g]['_chunk_contact'])) if '_chunk_contact' in feats[g] else None,
                 'tee_speed_mean_mm': float(np.nanmean(ts)) if np.isfinite(ts).any() else None,
                 'eef_speed_mean_mm': float(np.nanmean(feats[g]['eef_speed'])) if 'eef_speed' in feats[g] else None,
                 'eef_z_std_mm': float(np.nanstd(feats[g]['eef_z'])) if 'eef_z' in feats[g] else None,
@@ -486,7 +500,7 @@ def main():
     SPACES['tee_step_mag_yaw'] = ('tee_step_mag', 'tee_step_yaw', f'T step over {args.chunk}: |dxy| (mm) vs dyaw (deg)')
 
     # Shared edges per feature over the union of groups.
-    all_names = sorted(set().union(*[feats[g].keys() for g in groups]))
+    all_names = sorted(n for n in set().union(*[feats[g].keys() for g in groups]) if not n.startswith('_'))
     edges1d, constant = {}, {}
     for n in all_names:
         vals = [feats[g][n] for g in groups if n in feats[g]]
@@ -528,10 +542,12 @@ def main():
     (out / 'metrics.json').write_text(json.dumps({'args': vars(args), 'stats': stats, 'constant': constant, 'push': push, 'coverage': metrics}, indent=2))
     k = args.min_count
     lines = ['# State density / coverage', '', '## Per-group stats', '',
-             '| group | frames | episodes | mean len | T moving frac | T speed mm/step | TCP speed mm/step |', '|---|---|---|---|---|---|---|']
+             f'T translates = T centre moves > {args.moving_mm} mm/step; T moves = translates or |yaw rate| > {args.moving_deg} deg/step; '
+             f'chunk contact = share of {args.chunk}-step chunks (s_t -> s_t+{args.chunk}) with >= 1 moving step.', '',
+             '| group | frames | episodes | mean len | T translates | T moves | chunk contact | T speed mm/step | TCP speed mm/step |', '|---|---|---|---|---|---|---|---|---|']
     fmt = lambda v, p=3: '-' if v is None else f'{v:.{p}f}'  # noqa: E731
     for g, st in stats.items():
-        lines.append(f"| {g} | {st['frames']:,} | {st['episodes']:,} | {st['mean_ep_len']:.1f} | {fmt(st['tee_moving_frac'])} | {fmt(st['tee_speed_mean_mm'], 2)} | {fmt(st['eef_speed_mean_mm'], 2)} |")
+        lines.append(f"| {g} | {st['frames']:,} | {st['episodes']:,} | {st['mean_ep_len']:.1f} | {fmt(st['tee_moving_frac'])} | {fmt(st['tee_moved_frac'])} | {fmt(st['chunk_contact_frac'])} | {fmt(st['tee_speed_mean_mm'], 2)} | {fmt(st['eef_speed_mean_mm'], 2)} |")
     if constant:
         lines += ['', '## Constant features (range < 0.01, not plotted)', '']
         lines += [f'- {n} = {v:.3f}' for n, v in constant.items()]
