@@ -101,13 +101,26 @@ def parse_args():
     return p.parse_args()
 
 
+def is_table(p):
+    return p.is_dir() and (p / '_versions').is_dir()
+
+
 def resolve(path):
+    """Frames table + its <table>_episodes side table.
+
+    Accepts the table itself, or a directory holding it at most two levels
+    down (e.g. where a dataset archive was extracted).
+    """
     p = Path(path)
-    if p.suffix == '.lance':
+    if is_table(p):
         return p, p.with_name(p.stem + '_episodes.lance')
-    tables = sorted(t for t in p.glob('*.lance') if not t.stem.endswith(('_episodes', '_videos')))
+    tables = sorted(
+        t
+        for t in [*p.glob('*.lance'), *p.glob('*/*.lance')]
+        if is_table(t) and not t.stem.endswith(('_episodes', '_videos'))
+    )
     if len(tables) != 1:
-        raise SystemExit(f'{path}: expected one frames *.lance table, found {[t.name for t in tables]}')
+        raise SystemExit(f'{path}: expected one frames *.lance table, found {[str(t) for t in tables]}')
     return tables[0], tables[0].with_name(tables[0].stem + '_episodes.lance')
 
 
