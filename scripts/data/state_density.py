@@ -16,9 +16,10 @@ Only low-dimensional columns are read (no pixel decoding). Per frame:
   dynamics   T speed, T yaw rate, TCP speed per step (finite differences)
   action     action dims (2D density of the first two)
   qpos       per-joint marginals                    obs_agent_qpos
-  transition s_t -> s_t+1 (aligned with action_t): T step in the T frame, and
+  transition s_t -> s_t+K (aligned with the action chunk a_t..a_t+K-1, K = --chunk,
+             default 5 = the training frameskip): T step in the T frame, and
              push maps over the pusher position in the T frame: mean T step
-             (arrows) and how many pusher-motion directions the data holds
+             (arrows) and how many net pusher-motion directions the data holds
              per position (action diversity per state)
 
 Coverage metrics per 2D space (support = bins any group visits):
@@ -107,6 +108,7 @@ def parse_args():
     p.add_argument('--yaw-bins', type=int, default=72, help='bins over 360 deg for angles')
     p.add_argument('--min-count', type=int, default=10, help='visits for coverage_k')
     p.add_argument('--clip-pct', type=float, default=0.05, help='range = [pct, 100-pct] percentiles of the union (non-angular)')
+    p.add_argument('--chunk', type=int, default=5, help='transition length K: tuples (s_t, a_t..a_t+K-1, s_t+K); 5 = training frameskip')
     p.add_argument('--moving-mm', type=float, default=0.5, help='T speed (mm/step) above which the T counts as moving')
     p.add_argument('--batch-size', type=int, default=65536)
     p.add_argument('--out', default='reports/state_density')
@@ -181,7 +183,7 @@ def wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
-def features(d):
+def features(d, chunk=1):
     """Per-frame physical features (mm / deg) from the raw columns."""
     f = {}
     ep = d['episode_idx']
@@ -235,14 +237,18 @@ def features(d):
     if 'eef_x' in f:
         f['eef_speed'] = np.hypot(step_diff(f['eef_x']), step_diff(f['eef_y']))
 
-    # Forward differences s_t+1 - s_t, aligned with action_t (NaN on the last frame).
-    last = np.r_[ep[1:] != ep[:-1], True]
+    # Chunk transitions s_t+K - s_t, aligned with the action chunk a_t..a_t+K-1
+    # (the model's frameskip); NaN where t+K leaves the episode.
+    n = len(ep)
+    j = np.arange(n) + chunk
+    valid = j < n
+    valid[valid] = ep[j[valid]] == ep[valid]
 
     def next_diff(x, angular=False):
-        dx = np.r_[np.diff(x), np.nan]
+        dx = np.full_like(x, np.nan)
+        dx[valid] = x[j[valid]] - x[valid]
         if angular:
             dx = np.degrees(wrap(np.radians(dx)))
-        dx[last] = np.nan
         return dx
 
     if 'tee_x' in f:
@@ -345,7 +351,7 @@ def plot_grid(fname, space_names, groups, hists, edges, out):
     plt.close(fig)
 
 
-def push_maps(f, k):
+def push_maps(f, k, chunk=1):
     """Per pusher-in-T-frame cell: frames, mean T step (T frame), and pusher-direction diversity.
 
     Directions are the pusher's own motion s_t -> s_t+1 in the T frame, binned
@@ -362,7 +368,7 @@ def push_maps(f, k):
     sums = {n: np.histogram2d(x, y, bins=(e, e), weights=f[n][ok])[0] for n in ('tee_step_x', 'tee_step_y', 'tee_step_mag')}
     with np.errstate(invalid='ignore', divide='ignore'):
         mean = {n: v / count for n, v in sums.items()}
-    moving = np.hypot(f['push_x'][ok], f['push_y'][ok]) > PUSH_MOVE_MM
+    moving = np.hypot(f['push_x'][ok], f['push_y'][ok]) > PUSH_MOVE_MM * chunk
     ang = np.arctan2(f['push_y'][ok], f['push_x'][ok])
     ea = np.linspace(-np.pi, np.pi, PUSH_DIRS + 1)
     cube = np.histogramdd(np.stack([x[moving], y[moving], ang[moving]], 1), bins=(e, e, ea))[0]
@@ -373,10 +379,10 @@ def push_maps(f, k):
     return {'edges': e, 'count': count, 'mean': mean, 'dirs': dirs, 'dir_entropy': dir_ent, 'moving_count': cube.sum(-1)}
 
 
-def push_metrics(m, k):
+def push_metrics(m, k, chunk=1):
     """Summaries over cells where the pusher is near the T (>= k frames) and over contact cells (T moves)."""
     cells = m['count'] >= k
-    contact = cells & (np.nan_to_num(m['mean']['tee_step_mag']) > 1.0)
+    contact = cells & (np.nan_to_num(m['mean']['tee_step_mag']) > 1.0 * chunk)
     w = m['moving_count']
     out = {}
     for name, mask in (('near', cells), ('contact', contact)):
@@ -388,7 +394,7 @@ def push_metrics(m, k):
     return out
 
 
-def plot_push(groups, maps, out):
+def plot_push(groups, maps, out, chunk=1):
     groups = [g for g in groups if maps.get(g) is not None]
     if not groups:
         return
@@ -406,7 +412,7 @@ def plot_push(groups, maps, out):
         u = np.where(m['count'] >= 20, m['mean']['tee_step_x'], np.nan)
         v = np.where(m['count'] >= 20, m['mean']['tee_step_y'], np.nan)
         X, Y = np.meshgrid(c, c, indexing='ij')
-        ax.quiver(X, Y, u, v, color=INK, angles='xy', scale_units='xy', scale=0.25, width=0.004)
+        ax.quiver(X, Y, u, v, color=INK, angles='xy', scale_units='xy', scale=0.25 * chunk, width=0.004)
         ax2 = axes[i, 1]
         dirs = np.where(m['count'] >= 20, m['dirs'], np.nan)
         im1 = ax2.pcolormesh(e, e, dirs.T, cmap=SEQ_CMAP, vmin=0, vmax=PUSH_DIRS, rasterized=True)
@@ -416,9 +422,9 @@ def plot_push(groups, maps, out):
             style(a)
         ax.set_ylabel(g, fontsize=9, color=INK)
         if i == 0:
-            ax.set_title('Mean T step by pusher position (T frame)', fontsize=9, color=INK)
-            ax2.set_title(f'Pusher directions seen (of {PUSH_DIRS})', fontsize=9, color=INK)
-    fig.colorbar(im0, ax=axes[:, 0], location='bottom', shrink=0.85, aspect=25, label='mean |T step| (mm/step); arrows = mean step x4')
+            ax.set_title(f'Mean T step s_t->s_t+{chunk} by pusher position (T frame)', fontsize=9, color=INK)
+            ax2.set_title(f'Pusher chunk directions seen (of {PUSH_DIRS})', fontsize=9, color=INK)
+    fig.colorbar(im0, ax=axes[:, 0], location='bottom', shrink=0.85, aspect=25, label=f'mean |T step| over {chunk} steps (mm); arrows = mean step x{4 / chunk:g}')
     fig.colorbar(im1, ax=axes[:, 1], location='bottom', shrink=0.85, aspect=25, label='directions with >= k frames')
     fig.savefig(out / 'push.png', dpi=130)
     plt.close(fig)
@@ -459,7 +465,7 @@ def main():
     for spec in args.datasets:
         label, path = spec.split('=', 1)
         data, ep_table = load(path, args.episode_stride, args.batch_size)
-        f = features(data)
+        f = features(data, args.chunk)
         for g, mask in split_groups(label, data, ep_table, args.split_by):
             feats[g] = {k: v[mask] for k, v in f.items()}
             ep = data['episode_idx'][mask]
@@ -476,6 +482,8 @@ def main():
         del data
     groups = list(feats)
     print('groups:', groups)
+    SPACES['tee_step'] = ('tee_step_x', 'tee_step_y', f'T step s_t->s_t+{args.chunk}, T frame (mm)')
+    SPACES['tee_step_mag_yaw'] = ('tee_step_mag', 'tee_step_yaw', f'T step over {args.chunk}: |dxy| (mm) vs dyaw (deg)')
 
     # Shared edges per feature over the union of groups.
     all_names = sorted(set().union(*[feats[g].keys() for g in groups]))
@@ -513,9 +521,9 @@ def main():
     for fname, names in FIGURES.items():
         plot_grid(fname, names, groups, hists, edges2d, out)
     plot_marginals(feats, groups, edges1d, out)
-    maps = {g: push_maps(feats[g], args.min_count) for g in groups}
-    plot_push(groups, maps, out)
-    push = {g: push_metrics(m, args.min_count) for g, m in maps.items() if m is not None}
+    maps = {g: push_maps(feats[g], args.min_count, args.chunk) for g in groups}
+    plot_push(groups, maps, out, args.chunk)
+    push = {g: push_metrics(m, args.min_count, args.chunk) for g, m in maps.items() if m is not None}
 
     (out / 'metrics.json').write_text(json.dumps({'args': vars(args), 'stats': stats, 'constant': constant, 'push': push, 'coverage': metrics}, indent=2))
     k = args.min_count
@@ -530,7 +538,8 @@ def main():
     if push:
         lines += ['', f'## Transitions: pusher-direction diversity per pusher-in-T-frame cell '
                   f'({PUSH_CELLS}x{PUSH_CELLS} cells over +/-{PUSH_HALF_MM:.0f} mm, {PUSH_DIRS} directions, >= {k} frames)', '',
-                  'near = cells with >= k frames; contact = near cells where the mean T step > 1 mm. '
+                  f'Transitions are chunks s_t -> s_t+{args.chunk}; directions are the pusher\'s net chunk motion. '
+                  f'near = cells with >= k frames; contact = near cells where the mean T step > {args.chunk} mm. '
                   'dirs = directions seen (frame-weighted mean), H = direction entropy / log(dirs total).', '',
                   '| group | near cells | near dirs | near H | contact cells | contact dirs | contact H | contact cells >= 8 dirs |',
                   '|---|---|---|---|---|---|---|---|']
