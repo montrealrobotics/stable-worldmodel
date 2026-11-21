@@ -32,6 +32,7 @@ loss:
     num_samples: 64 # CEM population per iteration
     topk: 8 # elites per iteration; loss ranks expert vs cem_steps * topk
     num_perturbed: 16 # expert + Gaussian noise negatives, block shortcut learning
+    in_batch: 0 # other clips' expert plans as negatives (no simulation); with cem_steps 0, no CEM
     perturb_std: 0.5 # noise std in normalized action units
     var_scale: 1.0 # match solver.var_scale
     temperature: 1.0 # scale on summed goal MSE

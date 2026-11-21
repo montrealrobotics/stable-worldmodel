@@ -261,11 +261,13 @@ def clip_plans(plans, cfg):
 
 
 def search_negatives(model, batch, emb, cfg):
-    """Expert plan, perturbed experts and CEM elites: (B, 1 + P + E, T, A).
+    """Expert, perturbed experts, in-batch and CEM elites: (B, 1+P+I+E, T, A).
 
-    Index 0 is the expert, then ``num_perturbed`` noisy experts, then the
-    ``cem_steps * topk`` elites in CEM-round order. Also used by the
-    on-policy collector to pick the plans it executes in the simulator.
+    Index 0 is the expert, then ``num_perturbed`` noisy experts, then
+    ``in_batch`` expert plans of other clips in the batch (no simulation:
+    cheap, real action style), then the ``cem_steps * topk`` elites in
+    CEM-round order. ``cem_steps: 0`` skips CEM. Also used by the on-policy
+    collector to pick the plans it executes in the simulator.
     """
     H, search = cfg.wm.history_size, cfg.loss.search
     T = search.horizon
@@ -305,7 +307,23 @@ def search_negatives(model, batch, emb, cfg):
         device=actions.device,
         dtype=actions.dtype,
     )
-    return torch.cat([expert, clip_plans(perturbed, cfg), *elites], 1)
+    # Other clips' expert plans, K distinct ones per clip, never its own.
+    n_batch = search.get('in_batch', 0)
+    if n_batch:
+        if n_batch > B - 1:
+            raise ValueError(
+                f'loss.search.in_batch={n_batch} needs more than {n_batch} '
+                f'search clips per batch, got {B}'
+            )
+        scores = torch.rand(B, B, device=actions.device)
+        scores.fill_diagonal_(float('inf'))
+        others = scores.argsort(1)[:, :n_batch]
+        in_batch = [expert[others, 0]]
+    else:
+        in_batch = []
+    return torch.cat(
+        [expert, clip_plans(perturbed, cfg), *in_batch, *elites], 1
+    )
 
 
 def search_loss(model, batch, emb, cfg):

@@ -276,3 +276,61 @@ def test_sigreg_on_prediction_frames(search_loss, all_frames):
     torch.testing.assert_close(
         out['sigreg_loss'], sigreg(emb[:, :frames].transpose(0, 1))
     )
+
+
+def test_in_batch_negatives_without_cem(search_loss):
+    """in_batch adds other clips' expert plans (never the clip's own, no
+    repeats); cem_steps 0 skips CEM, so the plans are expert + P + I."""
+    script = Path(__file__).resolve().parents[2] / 'scripts/train/lewm.py'
+    spec = importlib.util.spec_from_file_location('lewm_inbatch_test', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    torch.manual_seed(0)
+    H, T, B, P, I = 2, 3, 6, 2, 4
+    cfg = OmegaConf.create(
+        {
+            'wm': {'history_size': H},
+            'loss': {
+                'search': {
+                    'horizon': T,
+                    'bptt': True,
+                    'cem_steps': 0,
+                    'num_samples': 8,
+                    'topk': 2,
+                    'num_perturbed': P,
+                    'perturb_std': 0.5,
+                    'var_scale': 1.0,
+                    'temperature': 1.0,
+                    'in_batch': I,
+                }
+            },
+        }
+    )
+    model = LeWMState(
+        encoder=_identity(2),
+        predictor=_Predictor(),
+        action_encoder=_identity(2),
+    )
+    actions = torch.randn(B, H + T, 2)
+    state = torch.cat([torch.zeros(B, 1, 2), actions[:, :-1].cumsum(1)], dim=1)
+    batch = model.encode({'state': state, 'action': actions})
+
+    plans = module.search_negatives(model, batch, batch['emb'], cfg)
+    assert plans.shape == (B, 1 + P + I, T, 2)
+    experts = actions[:, H - 1 : H - 1 + T]
+    for i in range(B):
+        # Each in-batch plan is exactly one other clip's expert plan.
+        match = (plans[i, 1 + P :, None] == experts[None]).flatten(2).all(-1)
+        owners = match.float().argmax(1)
+        assert match.any(1).all()
+        assert i not in owners.tolist()
+        assert len(set(owners.tolist())) == I
+
+    loss = search_loss(model, batch, batch['emb'], cfg)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert model.action_encoder.weight.grad.abs().sum() > 0
+
+    cfg.loss.search.in_batch = B  # only B - 1 other clips exist
+    with pytest.raises(ValueError, match='in_batch'):
+        module.search_negatives(model, batch, batch['emb'], cfg)
