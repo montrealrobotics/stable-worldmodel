@@ -8,7 +8,7 @@ defaults:
 
 init_from: null
 output_model_name: lewm_scratch_search
-save_step_interval: 5000
+save_step_interval: null # epoch checkpoints only; set N for weights_step_N.pt
 save_epoch_interval: 5
 
 data:

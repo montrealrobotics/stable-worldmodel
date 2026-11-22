@@ -916,10 +916,8 @@ def run(cfg):
         run_name=cfg.output_model_name,
         cfg=cfg.model,
         epoch_interval=cfg.get('save_epoch_interval', 1),
-        # Step-based runs may never reach an epoch interval.
-        step_interval=cfg.get('save_step_interval')
-        if cfg.trainer.max_steps > 0
-        else None,
+        # weights_step_N.pt every N batches, in step- and epoch-based runs.
+        step_interval=cfg.get('save_step_interval'),
         policy_cfg=cfg.loss.gfn.policy if use_gfn else None,
     )
 

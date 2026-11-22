@@ -19,7 +19,8 @@ encoder_scale: tiny
 embed_dim: ${vit_embed_dim:${encoder_scale}}
 dump_object: True
 compile: true
-save_step_interval: 5000
+# Export weights_step_N.pt every N batches (null: none); works with max_steps or max_epochs.
+save_step_interval: null
 # Export weights_epoch_N.pt every N epochs; the final weights always save.
 save_epoch_interval: 5
 # Encoder loss-gradient diagnostics at steps 0, 100, ...; 0 disables them.
