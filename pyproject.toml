@@ -34,7 +34,7 @@ swm = "stable_worldmodel.cli:app"
 maniskill = ["mani_skill>=3.0.0b21"]
 
 train = [
-    "transformers>=4.50.0",
+    "transformers>=5.12", # 5.12 renamed the ViT weights; keep every cluster on the new names
     "stable-pretraining>=0.1.8",
     "datasets>=2.20.0",
     "hydra-submitit-launcher",
