@@ -116,9 +116,9 @@ def _hf_vit_key(key, to_current):
     import re
 
     src, dst = (
-        (r'(.*)\.encoder\.layer\.(\d+)\.(.*)', r'\1.layers.\2.')
+        (r'(.*\.)?encoder\.layer\.(\d+)\.(.*)', r'\1layers.\2.')
         if to_current
-        else (r'(.*)\.layers\.(\d+)\.(.*)', r'\1.encoder.layer.\2.')
+        else (r'(.*\.)?layers\.(\d+)\.(.*)', r'\1encoder.layer.\2.')
     )
     m = re.fullmatch(src, key)
     if m is None:

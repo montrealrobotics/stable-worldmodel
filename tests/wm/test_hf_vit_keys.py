@@ -47,3 +47,10 @@ def test_matching_or_unfixable_keys_unchanged():
     sd = _sd(CURRENT)
     assert match_hf_vit_keys(sd, CURRENT) is sd
     assert match_hf_vit_keys(sd, CURRENT + ['extra']) is sd
+
+
+def test_bare_vit_without_prefix():
+    legacy = [k[len('encoder.') :] for k in LEGACY[:-1]]
+    current = [k[len('encoder.') :] for k in CURRENT[:-1]]
+    assert list(match_hf_vit_keys(_sd(legacy), current)) == current
+    assert list(match_hf_vit_keys(_sd(current), legacy)) == legacy
