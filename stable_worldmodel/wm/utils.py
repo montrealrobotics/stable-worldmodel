@@ -92,8 +92,75 @@ def load_pretrained(name: str, cache_dir: str = None, extra_args=None):
             d[parts[-1]] = value
 
     model = instantiate(config)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(
+        match_hf_vit_keys(state_dict, model.state_dict().keys())
+    )
     return model
+
+
+# Hugging Face ViT renamed its weights between transformers 5.6 and 5.12:
+# (legacy, current) pieces of a key, matched inside '<prefix>.encoder.layer.N.'
+# vs '<prefix>.layers.N.'. 'attention.output.dense' must come before
+# 'output.dense'.
+_HF_VIT_RENAMES = (
+    ('attention.attention.query.', 'attention.q_proj.'),
+    ('attention.attention.key.', 'attention.k_proj.'),
+    ('attention.attention.value.', 'attention.v_proj.'),
+    ('attention.output.dense.', 'attention.o_proj.'),
+    ('intermediate.dense.', 'mlp.fc1.'),
+    ('output.dense.', 'mlp.fc2.'),
+)
+
+
+def _hf_vit_key(key, to_current):
+    import re
+
+    src, dst = (
+        (r'(.*)\.encoder\.layer\.(\d+)\.(.*)', r'\1.layers.\2.')
+        if to_current
+        else (r'(.*)\.layers\.(\d+)\.(.*)', r'\1.encoder.layer.\2.')
+    )
+    m = re.fullmatch(src, key)
+    if m is None:
+        return key
+    rest = m.group(3)
+    for legacy, current in _HF_VIT_RENAMES:
+        old, new = (legacy, current) if to_current else (current, legacy)
+        if rest.startswith(old):
+            rest = new + rest[len(old) :]
+            break
+    return m.expand(dst) + rest
+
+
+def match_hf_vit_keys(state_dict, expected_keys):
+    """Rename HF ViT encoder weights to the naming the model expects.
+
+    Checkpoints trained with transformers < 5.12 store
+    ``encoder.encoder.layer.N.attention.attention.query`` where newer versions
+    build ``encoder.layers.N.attention.q_proj`` (and the reverse). Returns the
+    state dict unchanged when its keys already match or no rename makes them.
+    """
+    expected = set(expected_keys)
+    if set(state_dict) == expected:
+        return state_dict
+    renamed = {}
+    for k, v in state_dict.items():
+        if k not in expected:  # only touch keys the model lacks
+            k = next(
+                (
+                    n
+                    for n in (_hf_vit_key(k, d) for d in (True, False))
+                    if n in expected
+                ),
+                k,
+            )
+        renamed[k] = v
+    if set(renamed) == expected:
+        logger.info(
+            'Renamed HF ViT weights to the installed transformers naming'
+        )
+        return renamed
+    return state_dict
 
 
 def _resolve(name: str, cache_dir: Path) -> tuple[Path, dict]:
