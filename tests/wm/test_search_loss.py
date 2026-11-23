@@ -278,15 +278,17 @@ def test_sigreg_on_prediction_frames(search_loss, all_frames):
     )
 
 
-def test_in_batch_negatives_without_cem(search_loss):
+@pytest.mark.parametrize('P', [2, 0])
+def test_in_batch_negatives_without_cem(search_loss, P):
     """in_batch adds other clips' expert plans (never the clip's own, no
-    repeats); cem_steps 0 skips CEM, so the plans are expert + P + I."""
+    repeats); cem_steps 0 skips CEM, so the plans are expert + P + I.
+    P = 0: the in-batch plans are the only negatives."""
     script = Path(__file__).resolve().parents[2] / 'scripts/train/lewm.py'
     spec = importlib.util.spec_from_file_location('lewm_inbatch_test', script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     torch.manual_seed(0)
-    H, T, B, P, I = 2, 3, 6, 2, 4
+    H, T, B, I = 2, 3, 6, 4
     cfg = OmegaConf.create(
         {
             'wm': {'history_size': H},
