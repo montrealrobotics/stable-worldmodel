@@ -127,7 +127,7 @@ def plot_cost(M, colors, out, sub):
     for ax in (a, b):
         style(ax)
         ax.set_ylim(bottom=0)
-    a.legend(loc='upper left', frameon=False, fontsize=8, labelcolor=INK2,
+    a.legend(loc='lower right', frameon=False, fontsize=8, labelcolor=INK2,
              title='45° of rotation costs as much as … of T motion', title_fontsize=7.5)
     top = header(fig, 'Does the planning cost (embedding distance) notice rotation?',
                  sub + ' · squared embedding distance between two real frames of the same clip, in units of the median')
