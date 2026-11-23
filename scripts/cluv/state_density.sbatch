@@ -55,6 +55,9 @@ export MPLCONFIGDIR="$SLURM_TMPDIR/mpl"
 
 # Compute nodes may be offline (UV_OFFLINE=1): the same extras as training,
 # which are already in the uv cache (matplotlib comes in with train).
+# Private venv per job: `cluv sync` / `cluv submit` run a plain `uv sync` (no extras) on the shared
+# project .venv, which deletes the train/data extras under any job still using it.
+export UV_PROJECT_ENVIRONMENT="${SLURM_TMPDIR:?}/venv"
 uv run --extra train --extra data python scripts/data/state_density.py \
   "${SPECS[@]}" \
   --out "$OUT" \

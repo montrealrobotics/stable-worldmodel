@@ -33,5 +33,8 @@ OUT="$SCRATCH/logs/stable-worldmodel/dataset_task_coverage/${RUN_NAME}_${SLURM_J
 mkdir -p "$OUT"
 export MPLCONFIGDIR="$SLURM_TMPDIR/mpl"
 
+# Private venv per job: `cluv sync` / `cluv submit` run a plain `uv sync` (no extras) on the shared
+# project .venv, which deletes the train/data extras under any job still using it.
+export UV_PROJECT_ENVIRONMENT="${SLURM_TMPDIR:?}/venv"
 uv run --extra train --extra data python scripts/data/dataset_task_coverage.py \
   --dataset "$DATASET" --out "$OUT" "$@"

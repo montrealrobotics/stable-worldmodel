@@ -47,6 +47,9 @@ export STABLEWM_HOME="$SCRATCH/le-wm"
 RUN_NAME="${RUN_NAME}_${SLURM_JOB_ID}"
 # img_size and history_size must match the pretrained run. Compute nodes may
 # be offline (UV_OFFLINE=1): the extras must already be in the uv cache.
+# Private venv per job: `cluv sync` / `cluv submit` run a plain `uv sync` (no extras) on the shared
+# project .venv, which deletes the train/data extras under any job still using it.
+export UV_PROJECT_ENVIRONMENT="${SLURM_TMPDIR:?}/venv"
 uv run --extra train --extra data python scripts/train/lewm.py \
   --config-name=lewm_search \
   init_from="$INIT_FROM" \

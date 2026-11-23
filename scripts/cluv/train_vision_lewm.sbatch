@@ -43,6 +43,9 @@ export STABLEWM_HOME="$SCRATCH/le-wm"
 RUN_NAME="${RUN_NAME}_${SLURM_JOB_ID}"
 # Compute nodes may be offline (UV_OFFLINE=1): the extras must already be in
 # the uv cache, e.g. from `cluv run <cluster> uv sync --extra train --extra data`.
+# Private venv per job: `cluv sync` / `cluv submit` run a plain `uv sync` (no extras) on the shared
+# project .venv, which deletes the train/data extras under any job still using it.
+export UV_PROJECT_ENVIRONMENT="${SLURM_TMPDIR:?}/venv"
 uv run --extra train --extra data python scripts/train/lewm.py \
   --config-name="$CONFIG_NAME" \
   data=maniskill_vision \

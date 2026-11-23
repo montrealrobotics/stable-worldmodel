@@ -36,6 +36,9 @@ OUT="$SCRATCH/logs/stable-worldmodel/eval_goal_density/${RUN_NAME}_${SLURM_JOB_I
 mkdir -p "$OUT"
 export MPLCONFIGDIR="$SLURM_TMPDIR/mpl"
 
+# Private venv per job: `cluv sync` / `cluv submit` run a plain `uv sync` (no extras) on the shared
+# project .venv, which deletes the train/data extras under any job still using it.
+export UV_PROJECT_ENVIRONMENT="${SLURM_TMPDIR:?}/venv"
 uv run --extra train --extra data python scripts/data/eval_goal_density.py \
   --results-glob "$RESULTS_GLOB" \
   --cache-dir "$CACHE_DIR" \

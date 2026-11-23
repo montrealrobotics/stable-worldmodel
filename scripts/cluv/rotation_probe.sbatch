@@ -32,4 +32,7 @@ export STABLEWM_HOME="$SCRATCH/le-wm"
 export HF_HOME="$SCRATCH/huggingface"
 export MPLCONFIGDIR="$SLURM_TMPDIR/mpl"
 
+# Private venv per job: `cluv sync` / `cluv submit` run a plain `uv sync` (no extras) on the shared
+# project .venv, which deletes the train/data extras under any job still using it.
+export UV_PROJECT_ENVIRONMENT="${SLURM_TMPDIR:?}/venv"
 uv run --extra train --extra data python scripts/plan/rotation_probe.py --out "$OUT" "$@"
