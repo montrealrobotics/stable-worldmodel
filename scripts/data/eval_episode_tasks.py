@@ -31,8 +31,11 @@ def parse_list(text, key):
     )
 
 
-def load_episodes(run_id, epoch, eval_root=EVAL_ROOT):
-    """Episodes of every g/h cell of one checkpoint (last result in each file)."""
+def load_episodes(run_id, epoch, eval_root=EVAL_ROOT, horizons=None):
+    """Episodes of every g/h cell of one checkpoint (last result in each file).
+
+    horizons: planning horizons to keep (None = all).
+    """
     rows = []
     pattern = f'{eval_root}/*_{run_id}_ep{epoch}_g*_h*/random_goal_pusht_results.txt'
     for f in sorted(glob.glob(pattern)):
@@ -42,6 +45,8 @@ def load_episodes(run_id, epoch, eval_root=EVAL_ROOT):
         cfg_text, res = block.split('==== RESULTS ====', 1)
         cfg = yaml.safe_load(cfg_text)
         g, h = int(cfg['eval']['goal_offset_steps']), int(cfg['plan_config']['horizon'])
+        if horizons and h not in horizons:
+            continue
         seeds, ok = parse_list(res, 'seeds'), parse_list(res, 'episode_successes')
         xy, yaw, eef = (
             parse_list(res, k)
@@ -104,12 +109,15 @@ def load_tasks(wanted, cache_dir=CACHE_DIR):
     return tasks
 
 
-def load_runs(runs, cache_dir=CACHE_DIR, eval_root=EVAL_ROOT):
+def load_runs(runs, cache_dir=CACHE_DIR, eval_root=EVAL_ROOT, horizons=None):
     """{name: (run_id, epoch)} -> {name: episodes joined with their task features}.
 
     Episodes whose task is not in the cache are dropped (printed).
     """
-    episodes = {name: load_episodes(rid, ep, eval_root) for name, (rid, ep) in runs.items()}
+    episodes = {name: load_episodes(rid, ep, eval_root, horizons) for name, (rid, ep) in runs.items()}
+    for name, rows in episodes.items():
+        if not rows:
+            print(f'WARNING {name} {runs[name]}: no eval results for horizons {horizons or "all"}')
     wanted = {(r['seed'], r['g']) for rows in episodes.values() for r in rows}
     tasks = load_tasks(wanted, cache_dir)
     print(f'{len(wanted)} (seed, g) tasks, {len(set(tasks) & wanted)} found in the cache')
@@ -120,11 +128,35 @@ def load_runs(runs, cache_dir=CACHE_DIR, eval_root=EVAL_ROOT):
     return out
 
 
-def parse_runs(items):
-    """['name=run_id:epoch', ...] -> {name: (run_id, epoch)}."""
+def parse_runs(items, epoch=None):
+    """['name=run_id:epoch' or 'name=run_id', ...] -> {name: (run_id, epoch)}.
+
+    epoch (e.g. from --epoch) overrides every run's checkpoint epoch.
+    """
     runs = {}
     for item in items:
         name, spec = item.split('=', 1)
-        rid, ep = spec.split(':')
-        runs[name] = (rid, int(ep))
+        rid, _, ep = spec.partition(':')
+        if epoch is None and not ep:
+            raise SystemExit(f'{item}: no epoch; write name=run_id:epoch or pass --epoch')
+        runs[name] = (rid, int(epoch if epoch is not None else ep))
     return runs
+
+
+def int_list(text):
+    """'2' or '2,3' -> [2] / [2, 3] (one argument, so it never swallows run specs)."""
+    return [int(x) for x in text.split(',') if x]
+
+
+def add_selection_args(p):
+    """--epoch / --horizons: which checkpoint and planning horizons to analyse."""
+    p.add_argument('--epoch', type=int, default=None, help='checkpoint epoch for every run (overrides run_id:epoch)')
+    p.add_argument('--horizons', type=int_list, default=None, help='planning horizons to keep, e.g. 2 or 2,3 (default: all)')
+
+
+def selection_label(runs, horizons):
+    epochs = sorted({ep for _, ep in runs.values()})
+    ep = f'epoch {epochs[0]}' if len(epochs) == 1 else 'epochs ' + '/'.join(map(str, epochs))
+    return f'{ep}, horizon{"s" if not horizons or len(horizons) > 1 else ""} ' + (
+        ', '.join(map(str, sorted(horizons))) if horizons else 'all'
+    )

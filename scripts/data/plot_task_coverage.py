@@ -10,6 +10,8 @@ Writes PNGs next to the inputs:
                       tasks on top, marked solved / failed by the in-batch model
   similar.png         success vs how many training windows make the same move
 Model groups average their seeds: base = base_s*, CEM = cem_s*.
+--horizons 2 (or 2,3) plots success for those planning horizons only; the
+checkpoint is chosen when dataset_task_coverage.py runs (--epoch / run specs).
 """
 
 import argparse
@@ -29,6 +31,7 @@ SURFACE, INK, INK2, MUTED = '#fcfcfb', '#0b0b0b', '#52514e', '#898781'
 GRID, AXIS = '#e1e0d9', '#c3c2b7'
 DATA_BAR, EVAL_BAR = '#b5b3ab', '#52514e'
 SEQ = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b']
+SELECTION = ''  # e.g. 'epoch 20 · planning horizon 2', set by load()
 GROUPS = [  # (label, csv run-name prefix, color); fixed order = fixed colors
     ('in-batch negatives', 'inbatch', '#2a78d6'),
     ('CEM negatives', 'cem_', '#eb6834'),
@@ -53,17 +56,29 @@ def style(ax):
     ax.set_axisbelow(True)
 
 
-def load(folder):
+def load(folder, horizons=None):
     rows = list(csv.DictReader(open(folder / 'tasks.csv')))
     meta = json.load(open(folder / 'windows.json'))
     runs = list(meta['runs'])
+    if horizons:
+        have = set(meta.get('horizons', []))
+        if not set(horizons) <= have:
+            raise SystemExit(f'horizons {horizons} not in this output (has {sorted(have)}); rerun dataset_task_coverage.py')
+        cols = {n: [f'success_{n}_h{h}' for h in horizons] for n in runs}
+    else:
+        cols = {n: [f'success_{n}'] for n in runs}
     tasks = []
     for r in rows:
         t = {k: float(v) for k, v in r.items() if v != '' and not k.startswith(('success_', 'episodes_'))}
         for label, prefix, _ in GROUPS:
-            vals = [float(r[f'success_{n}']) for n in runs if n.startswith(prefix) and r.get(f'success_{n}', '') != '']
+            vals = [float(r[c]) for n in runs if n.startswith(prefix) for c in cols[n] if r.get(c, '') != '']
             t[label] = np.mean(vals) if vals else np.nan
         tasks.append(t)
+    epochs = sorted({ep for _, ep in meta['runs'].values()})
+    hs = horizons or meta.get('horizons')
+    global SELECTION
+    SELECTION = (f'epoch {"/".join(map(str, epochs))} · planning horizon{"s" if not hs or len(hs) > 1 else ""} '
+                 + (', '.join(map(str, hs)) if hs else 'all'))
     groups = [(lab, col, sum(n.startswith(p) for n in runs)) for lab, p, col in GROUPS if any(n.startswith(p) for n in runs)]
     return tasks, meta, groups
 
@@ -96,7 +111,8 @@ def feature_panels(ax_top, ax_bot, tasks, meta, groups, key, title_on=True):
     ax_top.bar(x + w / 2 + 0.01, ev, w, color=EVAL_BAR, label='eval tasks')
     ax_top.set_ylabel('share (%)', color=INK2, fontsize=9)
     if title_on:
-        ax_top.set_title(title, color=INK, fontsize=11, loc='left', pad=8)
+        ax_top.set_title(title, color=INK, fontsize=11, loc='left', pad=18)
+        ax_top.text(0, 1.02, SELECTION, transform=ax_top.transAxes, fontsize=8, color=MUTED, va='bottom')
     for i, (dv, evv) in enumerate(zip(data, ev)):
         ax_top.text(i - w / 2, dv + 0.8, f'{dv:.0f}', ha='center', va='bottom', fontsize=7.5, color=INK2)
     style(ax_top)
@@ -194,7 +210,8 @@ def plot_map(tasks, meta, out, solver):
                label=f'eval task, {solver} solves < 50% ({(~good).sum()})', zorder=3)
     ax.set_xlabel('T rotation from start to goal (degrees)', color=INK2, fontsize=9)
     ax.set_ylabel('T displacement from start to goal (mm)', color=INK2, fontsize=9)
-    ax.set_title('Where the eval tasks sit in the training data', color=INK, fontsize=11, loc='left', pad=8)
+    ax.set_title('Where the eval tasks sit in the training data', color=INK, fontsize=11, loc='left', pad=18)
+    ax.text(0, 1.02, SELECTION, transform=ax.transAxes, fontsize=8, color=MUTED, va='bottom')
     ax.set_ylim(0, ey[-1])
     n_off = int((np.array([t['dxy'] for t in tasks]) >= ey[-1] - 2).sum())
     ax.text(0.0, -0.13, f'Tasks moving the T more than {ey[-1]:.0f} mm ({n_off}) are drawn at the top edge; '
@@ -223,7 +240,8 @@ def plot_similar(tasks, groups, out, key='similar_windows'):
     for i in x:
         a.text(i, low[i] + high[i] + 0.4, f'{low[i] + high[i]}', ha='center', va='bottom', fontsize=8, color=INK2)
     a.set_ylabel('eval tasks', color=INK2, fontsize=9)
-    a.set_title('Success vs how often the training data makes the same move', color=INK, fontsize=11, loc='left', pad=8)
+    a.set_title('Success vs how often the training data makes the same move', color=INK, fontsize=11, loc='left', pad=18)
+    a.text(0, 1.02, SELECTION, transform=a.transAxes, fontsize=8, color=MUTED, va='bottom')
     style(a)
     a.legend(loc='upper right', frameon=False, fontsize=8, labelcolor=INK2)
     for label, color, _ in groups:
@@ -247,14 +265,18 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('folder', type=Path)
     p.add_argument('--similar', default='similar_windows', choices=['similar_windows', 'similar_windows_2x'])
+    p.add_argument('--horizons', type=lambda t: [int(x) for x in t.split(',') if x], default=None,
+                   help='planning horizons to plot, e.g. 2 or 2,3 (default: all)')
+    p.add_argument('--suffix', default=None, help='file name suffix (default: _h<horizons> when --horizons is set)')
     args = p.parse_args()
-    tasks, meta, groups = load(args.folder)
+    tasks, meta, groups = load(args.folder, args.horizons)
+    sfx = args.suffix if args.suffix is not None else ('_h' + ''.join(map(str, args.horizons)) if args.horizons else '')
     plt.rcParams['font.family'] = ['DejaVu Sans']
     for k in FEATURES:
-        plot_feature(tasks, meta, groups, k, args.folder / f'feature_{k}.png')
-    plot_overview(tasks, meta, groups, args.folder / 'overview.png')
-    plot_map(tasks, meta, args.folder / 'map.png', groups[0][0])
-    plot_similar(tasks, groups, args.folder / 'similar.png', args.similar)
+        plot_feature(tasks, meta, groups, k, args.folder / f'feature_{k}{sfx}.png')
+    plot_overview(tasks, meta, groups, args.folder / f'overview{sfx}.png')
+    plot_map(tasks, meta, args.folder / f'map{sfx}.png', groups[0][0])
+    plot_similar(tasks, groups, args.folder / f'similar{sfx}.png', args.similar)
     print(f'wrote figures to {args.folder}')
 
 

@@ -11,7 +11,9 @@
 # Optional flags (before any script args):
 #   --dataset=<path>   default $SCRATCH/le-wm/datasets/overhead_rgb_noisy_replay_100k.lance
 #   --run-name=<name>
-# Everything else goes to the script (eval runs as name=run_id:epoch; default: the ep20 runs).
+# Everything else goes to the script: eval runs as name=run_id:epoch (default: the ep20 runs),
+# --epoch N (checkpoint for every run), --horizons 2 or 2,3 (default: all; tasks.csv always has
+# per-horizon success columns, so plot_task_coverage.py --horizons can pick them later).
 # Results: $SCRATCH/logs/stable-worldmodel/dataset_task_coverage/<run-name>_<job id>
 # Plots (laptop, after copying the folder): python scripts/data/plot_task_coverage.py <folder>
 

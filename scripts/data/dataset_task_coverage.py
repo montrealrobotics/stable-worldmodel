@@ -14,7 +14,8 @@ Per eval task (seed, g), from the expert goal cache:
   similar_windows_2x same with twice the tolerance
   start_frames       dataset frames with the T within tolerance of the start pose
   goal_frames        dataset frames with the T within tolerance of the goal pose
-  success_<run>      planning success over the task's eval episodes (all horizons)
+  success_<run>      planning success over the task's eval episodes (selected horizons)
+  success_<run>_h<k> the same for planning horizon k only (plot_task_coverage.py --horizons)
 Counts are split into expert / replay episodes (episode table replay_idx).
 
 Writes to --out: tasks.csv, windows.json (bin edges + counts), summary.md.
@@ -32,7 +33,7 @@ import numpy as np
 import pyarrow as pa
 from scipy.spatial import cKDTree
 
-from eval_episode_tasks import CACHE_DIR, EVAL_ROOT, XY_TOL_MM, YAW_TOL_RAD, load_runs, parse_runs
+from eval_episode_tasks import CACHE_DIR, EVAL_ROOT, XY_TOL_MM, YAW_TOL_RAD, add_selection_args, load_runs, parse_runs, selection_label
 
 DATASET = '/network/scratch/o/ozgur.aslan/le-wm/datasets/overhead_rgb_noisy_replay_100k.lance'
 DEFAULT_RUNS = [
@@ -122,23 +123,27 @@ def count_split(idx, expert):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('runs', nargs='*', default=DEFAULT_RUNS, help='name=run_id:epoch (default: the ep20 runs)')
+    p.add_argument('runs', nargs='*', default=DEFAULT_RUNS, help='name=run_id:epoch or name=run_id with --epoch (default: the ep20 runs)')
     p.add_argument('--dataset', default=DATASET)
     p.add_argument('--eval-root', default=EVAL_ROOT)
     p.add_argument('--cache-dir', default=CACHE_DIR)
     p.add_argument('--max-episodes', type=int, default=None, help='quick test: first N episodes only')
     p.add_argument('--out', default='reports/dataset_task_coverage')
+    add_selection_args(p)
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    runs = parse_runs(args.runs)
-    data = load_runs(runs, args.cache_dir, args.eval_root)
+    runs = parse_runs(args.runs, args.epoch)
+    selection = selection_label(runs, args.horizons)
+    print(f'selection: {selection}')
+    data = load_runs(runs, args.cache_dir, args.eval_root, args.horizons)
     tasks = {}  # (seed, g) -> features + per-run success
     for name, rows in data.items():
         for r in rows:
             t = tasks.setdefault((r['seed'], r['g']), {k: v for k, v in r.items() if k not in ('ok', 'h', 'xy', 'yaw', 'eef', 'start')})
             t.setdefault('_ok', {}).setdefault(name, []).append(r['ok'])
+            t.setdefault('_ok_h', {}).setdefault((name, r['h']), []).append(r['ok'])
     offsets = sorted({g for _, g in tasks})
     print(f'{len(tasks)} eval tasks, offsets {offsets}')
 
@@ -191,15 +196,19 @@ def main():
         f'{c}{s}' for c in ('similar_windows', 'similar_windows_2x', 'start_frames', 'goal_frames') for s in ('', '_expert')
     ]
     names = list(runs)
+    horizons = sorted({h for t in tasks.values() for _, h in t['_ok_h']})
+    per_h = [(n, h) for n in names for h in horizons]
     with open(out / 'tasks.csv', 'w', newline='') as fh:
         w = csv.writer(fh)
-        w.writerow(['seed', 'g', *feats, *counts, *[f'success_{n}' for n in names], *[f'episodes_{n}' for n in names]])
+        w.writerow(['seed', 'g', *feats, *counts, *[f'success_{n}' for n in names], *[f'episodes_{n}' for n in names],
+                    *[f'success_{n}_h{h}' for n, h in per_h]])
         for (seed, g), t in sorted(tasks.items()):
             ok = t['_ok']
             w.writerow(
                 [seed, g, *[float(t[k]) for k in feats], *[t[c] for c in counts]]
                 + [np.mean(ok[n]) if n in ok else '' for n in names]
                 + [len(ok.get(n, [])) for n in names]
+                + [np.mean(t['_ok_h'][k]) if k in t['_ok_h'] else '' for k in per_h]
             )
     as_list = lambda e: [x if np.isfinite(x) else None for x in e]  # noqa: E731
     json.dump(
@@ -210,6 +219,8 @@ def main():
             'offsets': offsets,
             'windows': n_windows,
             'runs': {n: list(v) for n, v in runs.items()},
+            'horizons': horizons,
+            'selection': selection,
             'bins': {k: as_list(e) for k, e in BINS.items()},
             'hist': {k: {s: v.tolist() for s, v in h.items()} for k, h in hist.items()},
             'eval_hist': {k: v.tolist() for k, v in eval_hist.items()},
@@ -225,6 +236,7 @@ def main():
         '',
         f'- dataset: `{args.dataset}`: {n_frames:,} frames, {n_eps:,} episodes; '
         f'{n_windows["all"]:,} windows for g in {offsets} ({n_windows["expert"] / max(1, n_windows["all"]):.0%} from expert episodes)',
+        f'- eval selection: {selection}',
         f'- eval tasks: {len(tasks)}; runs: {", ".join(f"{n} ({r[0]} ep{r[1]})" for n, r in runs.items())}',
         '',
     ]

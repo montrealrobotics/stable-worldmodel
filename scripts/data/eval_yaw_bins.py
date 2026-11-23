@@ -10,7 +10,7 @@ import argparse
 
 import numpy as np
 
-from eval_episode_tasks import CACHE_DIR, EVAL_ROOT, load_runs, parse_runs
+from eval_episode_tasks import CACHE_DIR, EVAL_ROOT, add_selection_args, load_runs, parse_runs, selection_label
 
 FINE = [(0, 0.2), (0.2, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, np.inf)]
 COARSE = [(0, 0.3), (0.3, 0.8), (0.8, np.inf)]
@@ -23,12 +23,15 @@ def rate(rows, cond):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('runs', nargs='+', help='name=run_id:epoch, e.g. inbatch=11811959:20')
+    p.add_argument('runs', nargs='+', help='name=run_id:epoch (or name=run_id with --epoch), e.g. inbatch=11811959:20')
     p.add_argument('--cutoff', type=float, default=0.8, help='high-rotation threshold (rad)')
     p.add_argument('--eval-root', default=EVAL_ROOT)
     p.add_argument('--cache-dir', default=CACHE_DIR)
+    add_selection_args(p)
     args = p.parse_args()
-    data = load_runs(parse_runs(args.runs), args.cache_dir, args.eval_root)
+    runs = parse_runs(args.runs, args.epoch)
+    print(f'selection: {selection_label(runs, args.horizons)}')
+    data = load_runs(runs, args.cache_dir, args.eval_root, args.horizons)
 
     for bins in (FINE, COARSE):
         print('\n|dyaw| rad   ' + ' '.join(f'{a:.1f}-{b:<4}'.replace('inf', '') for a, b in bins))

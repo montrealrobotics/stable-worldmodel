@@ -16,7 +16,7 @@ import argparse
 
 import numpy as np
 
-from eval_episode_tasks import CACHE_DIR, EEF_TOL_MM, EVAL_ROOT, XY_TOL_MM, YAW_TOL_RAD, load_runs, parse_runs
+from eval_episode_tasks import CACHE_DIR, EEF_TOL_MM, EVAL_ROOT, XY_TOL_MM, YAW_TOL_RAD, add_selection_args, load_runs, parse_runs, selection_label
 
 FEATURES = ['dxy', 'path_xy', 'deef', 'eef_T_start', 'eef_T_goal', 'T_r_goal', 'goal_step', 'start', 'dyaw']
 
@@ -41,12 +41,15 @@ def criteria(rows, label):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('runs', nargs='+', help='name=run_id:epoch; the first run sets the tercile edges')
+    p.add_argument('runs', nargs='+', help='name=run_id:epoch (or name=run_id with --epoch); the first run sets the tercile edges')
     p.add_argument('--max-dyaw', type=float, default=0.8, help='keep episodes below this rotation (rad)')
     p.add_argument('--eval-root', default=EVAL_ROOT)
     p.add_argument('--cache-dir', default=CACHE_DIR)
+    add_selection_args(p)
     args = p.parse_args()
-    data = load_runs(parse_runs(args.runs), args.cache_dir, args.eval_root)
+    runs = parse_runs(args.runs, args.epoch)
+    print(f'selection: {selection_label(runs, args.horizons)}')
+    data = load_runs(runs, args.cache_dir, args.eval_root, args.horizons)
     low = {n: [r for r in rows if r['dyaw'] < args.max_dyaw and 'xy' in r] for n, rows in data.items()}
 
     # 1. failing criterion and error sizes
