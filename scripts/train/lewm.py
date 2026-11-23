@@ -344,6 +344,36 @@ def search_loss(model, batch, emb, cfg):
     target = costs.new_zeros(costs.size(0), dtype=torch.long)
     return F.cross_entropy(-costs.float() / search.temperature, target)
 
+def search_anchor_loss(model, batch, emb, cfg):
+    """Multi-step MSE of the expert plan's rollout against the clip's own frames.
+
+    The InfoNCE only ranks plans, so it can move every rollout away from the
+    encoder's embedding space at no cost (probed rollouts of search-trained
+    models drift after ~2 steps). This anchors predicted step k of the expert
+    plan to the detached embedding of clip frame H - 1 + k, for k = 1..horizon.
+    Mean over steps and dims: the same scale as the one-step ``pred_loss``.
+    """
+    H, T = cfg.wm.history_size, cfg.loss.search.horizon
+    batch, emb = search_batch(batch, emb, cfg)
+    expert = batch['action'][:, None, H - 1 : H - 1 + T]
+    skip = ('action', 'emb', 'act_emb')
+    info = {
+        k: v[:, None, :H]
+        for k, v in batch.items()
+        if torch.is_tensor(v) and v.ndim > 1 and k not in skip
+    }
+    info['emb'] = emb[:, None, :H]
+    info['action_history'] = batch['action'][:, None, : H - 1]
+    pred = model.rollout(info, expert, H)['predicted_emb'][:, 0, H:]
+    return (pred - emb[:, H : H + T].detach()).pow(2).mean()
+
+def add_search_anchor(output, model, batch, emb, cfg):
+    """Add ``loss.search.anchor_weight`` * search_anchor_loss (off when 0)."""
+    weight = cfg.loss.search.get('anchor_weight', 0) or 0
+    if weight > 0:
+        output['search_anchor_loss'] = search_anchor_loss(model, batch, emb, cfg)
+        output['loss'] = output['loss'] + weight * output['search_anchor_loss']
+
 
 def gfn_temperature(gfn, step):
     """Reward temperature, annealed geometrically from tau_start to tau_end."""
@@ -581,6 +611,7 @@ def lejepa_forward(self, batch, stage, cfg):
             output['loss'] = (
                 output['loss'] + search.weight * output['search_loss']
             )
+            add_search_anchor(output, self.model, sub, s_emb, cfg)
     elif use_search_loss and search.get('separate_clips'):
         # Own longer clips (training only; validation batches carry none).
         if search_clips is not None:
@@ -593,9 +624,11 @@ def lejepa_forward(self, batch, stage, cfg):
             output['loss'] = (
                 output['loss'] + search.weight * output['search_loss']
             )
+            add_search_anchor(output, self.model, search_clips, s_emb, cfg)
     elif use_search_loss:
         output['search_loss'] = search_loss(self.model, batch, emb, cfg)
         output['loss'] = output['loss'] + search.weight * output['search_loss']
+        add_search_anchor(output, self.model, batch, emb, cfg)
 
     losses_dict = {
         f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k

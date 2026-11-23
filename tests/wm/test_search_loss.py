@@ -336,3 +336,46 @@ def test_in_batch_negatives_without_cem(search_loss, P):
     cfg.loss.search.in_batch = B  # only B - 1 other clips exist
     with pytest.raises(ValueError, match='in_batch'):
         module.search_negatives(model, batch, batch['emb'], cfg)
+
+
+def test_search_anchor_loss():
+    """The expert rollout is anchored to the clip's real frames: zero for exact
+    dynamics, positive and trainable otherwise; targets are detached."""
+    script = Path(__file__).resolve().parents[2] / 'scripts/train/lewm.py'
+    spec = importlib.util.spec_from_file_location('lewm_anchor_test', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    torch.manual_seed(0)
+    H, T, B = 2, 3, 4
+    cfg = OmegaConf.create(
+        {'wm': {'history_size': H}, 'loss': {'search': {'horizon': T, 'anchor_weight': 0.5}}}
+    )
+    model = LeWMState(encoder=_identity(2), predictor=_Predictor(), action_encoder=_identity(2))
+    actions = torch.randn(B, H + T, 2)
+    state = torch.cat([torch.zeros(B, 1, 2), actions[:, :-1].cumsum(1)], dim=1)
+
+    batch = model.encode({'state': state, 'action': actions})
+    assert module.search_anchor_loss(model, batch, batch['emb'], cfg) < 1e-10
+
+    with torch.no_grad():
+        model.action_encoder.weight.mul_(1.5)  # wrong dynamics: rollouts overshoot
+    batch = model.encode({'state': state, 'action': actions})
+    loss = module.search_anchor_loss(model, batch, batch['emb'], cfg)
+    assert loss > 0
+    loss.backward()
+    assert model.action_encoder.weight.grad.abs().sum() > 0
+
+    # Detached targets: with H context frames out of the graph, the encoder gets no gradient.
+    model.zero_grad()
+    batch = model.encode({'state': state, 'action': actions})
+    emb = torch.cat([batch['emb'][:, :H].detach(), batch['emb'][:, H:]], 1)  # targets keep their graph
+    module.search_anchor_loss(model, batch, emb, cfg).backward()
+    assert model.encoder.weight.grad is None or model.encoder.weight.grad.abs().sum() == 0
+
+    out = {'loss': torch.zeros(())}
+    module.add_search_anchor(out, model, batch, batch['emb'], cfg)
+    torch.testing.assert_close(out['loss'], 0.5 * out['search_anchor_loss'])
+    cfg.loss.search.anchor_weight = 0
+    out = {'loss': torch.zeros(())}
+    module.add_search_anchor(out, model, batch, batch['emb'], cfg)
+    assert 'search_anchor_loss' not in out

@@ -40,6 +40,10 @@ loss:
     # gfn: a co-trained GFlowNet policy samples them (settings in loss.gfn).
     sampler: cem
     batch_size: null # search loss on the first N clips of each batch; null = all
+    # Multi-step MSE anchoring the expert plan's rollout (steps 1..horizon) to the
+    # detached embeddings of the clip's real frames; keeps rollouts in the
+    # encoder's space, which the ranking-only InfoNCE does not. 0 = off.
+    anchor_weight: 0.0
     # Clamp CEM/perturbed plans to the dataset's normalized action range (the
     # env clips raw actions to it anyway). GFlowNet samples are not clamped.
     clip_actions: false
