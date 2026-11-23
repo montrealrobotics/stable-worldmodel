@@ -95,6 +95,8 @@ def load_tasks(wanted, cache_dir=CACHE_DIR):
             'T_r_goal': 1e3 * np.linalg.norm(p[i, :2]),  # goal T distance from the world origin
             'goal_step': i,
             'moved': dxy > 5 or dyaw > 0.05,  # False: the expert only moves the EEF
+            # raw poses (m, xyz + wxyz quaternion) for dataset matching
+            'start_pose': p[s], 'goal_pose': p[i], 'start_eef': e[s], 'goal_eef': e[i],
         }
         for key in ((seed, i - s), (int(r['seed']), i - s)):
             if key in wanted and key not in tasks:
