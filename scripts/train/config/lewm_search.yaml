@@ -44,6 +44,10 @@ loss:
     # detached embeddings of the clip's real frames; keeps rollouts in the
     # encoder's space, which the ranking-only InfoNCE does not. 0 = off.
     anchor_weight: 0.0
+    anchor_detach: true # false: anchor targets keep their graph (encoder also moves toward the rollout)
+    # true: goal / per-step target embeddings are fixed in the InfoNCE cost, as in
+    # planning; false: the cost's gradient also reaches the encoder through them.
+    detach_goal: true
     # Clamp CEM/perturbed plans to the dataset's normalized action range (the
     # env clips raw actions to it anyway). GFlowNet samples are not clamped.
     clip_actions: false

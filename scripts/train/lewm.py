@@ -196,7 +196,8 @@ def plan_costs(model, batch, emb, cfg, plans, all_steps=False):
     """Goal MSE of each plan rolled out from the context: (B, S, T, A) -> (B, S).
 
     The goal is the clip frame ``horizon`` blocks after the last context
-    frame, detached; gradients reach the model through the rollout.
+    frame, detached unless ``loss.search.detach_goal`` is false; gradients
+    reach the model through the rollout.
     ``all_steps``: (B, S, T) costs, step k against the clip frame k blocks
     after the last context frame.
     """
@@ -204,8 +205,11 @@ def plan_costs(model, batch, emb, cfg, plans, all_steps=False):
     T = search.horizon
     actions = batch['action']
     B = actions.size(0)
-    goal = emb[:, H - 1 + T, None].detach()
-    targets = emb[:, None, H : H + T].detach()  # (B, 1, T, ...)
+    # detach_goal (default true): the goal and per-step targets are fixed, as in
+    # planning; false lets the cost's gradient reach the encoder through them.
+    detach = (lambda x: x.detach()) if search.get('detach_goal', True) else (lambda x: x)
+    goal = detach(emb[:, H - 1 + T, None])
+    targets = detach(emb[:, None, H : H + T])  # (B, 1, T, ...)
     skip = ('action', 'emb', 'act_emb')
     heads = max(
         (m.heads for m in model.modules() if hasattr(m, 'heads')), default=1
@@ -240,8 +244,13 @@ def plan_costs(model, batch, emb, cfg, plans, all_steps=False):
         if all_steps:
             err = (info['predicted_emb'][:, :, -T:] - targets).pow(2)
             return err.flatten(3).sum(-1)  # (B, S, T), GoalMSE per step
-        info['goal_emb'] = goal
-        return GoalMSE()(info)  # (B, S)
+        if search.get('detach_goal', True):
+            info['goal_emb'] = goal
+            return GoalMSE()(info)  # (B, S)
+        # GoalMSE detaches the goal itself; same sum-reduced last-step MSE with
+        # the goal's graph kept, so the cost also trains the encoder through it.
+        err = (info['predicted_emb'][:, :, -1:] - goal[:, None]).pow(2)
+        return err.flatten(2).sum(-1)  # (B, S)
 
     # Attention kernels fail past 65535 rollouts * heads (CUDA grid limit).
     # shortcut: needs B * heads <= 65535, chunk B too if not.
@@ -350,7 +359,8 @@ def search_anchor_loss(model, batch, emb, cfg):
     The InfoNCE only ranks plans, so it can move every rollout away from the
     encoder's embedding space at no cost (probed rollouts of search-trained
     models drift after ~2 steps). This anchors predicted step k of the expert
-    plan to the detached embedding of clip frame H - 1 + k, for k = 1..horizon.
+    plan to the embedding of clip frame H - 1 + k, for k = 1..horizon; the
+    targets are detached unless ``loss.search.anchor_detach`` is false.
     Mean over steps and dims: the same scale as the one-step ``pred_loss``.
     """
     H, T = cfg.wm.history_size, cfg.loss.search.horizon
@@ -365,7 +375,10 @@ def search_anchor_loss(model, batch, emb, cfg):
     info['emb'] = emb[:, None, :H]
     info['action_history'] = batch['action'][:, None, : H - 1]
     pred = model.rollout(info, expert, H)['predicted_emb'][:, 0, H:]
-    return (pred - emb[:, H : H + T].detach()).pow(2).mean()
+    target = emb[:, H : H + T]
+    if cfg.loss.search.get('anchor_detach', True):  # false: the encoder also moves toward the rollout
+        target = target.detach()
+    return (pred - target).pow(2).mean()
 
 def add_search_anchor(output, model, batch, emb, cfg):
     """Add ``loss.search.anchor_weight`` * search_anchor_loss (off when 0)."""

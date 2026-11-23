@@ -379,3 +379,73 @@ def test_search_anchor_loss():
     out = {'loss': torch.zeros(())}
     module.add_search_anchor(out, model, batch, batch['emb'], cfg)
     assert 'search_anchor_loss' not in out
+
+
+@pytest.mark.parametrize('detach_goal', [True, False])
+def test_detach_goal_flag(search_loss, detach_goal):
+    """detach_goal false lets the InfoNCE gradient reach the encoder through the goal frame."""
+    torch.manual_seed(0)
+    H, T = 2, 3
+    cfg = OmegaConf.create(
+        {
+            'wm': {'history_size': H},
+            'loss': {
+                'search': {
+                    'horizon': T, 'bptt': True, 'cem_steps': 0, 'num_samples': 8, 'topk': 2,
+                    'num_perturbed': 4, 'perturb_std': 0.5, 'var_scale': 1.0, 'temperature': 1.0,
+                    'detach_goal': detach_goal,
+                }
+            },
+        }
+    )
+    model = LeWMState(encoder=_identity(2), predictor=_Predictor(), action_encoder=_identity(2))
+    with torch.no_grad():
+        model.action_encoder.weight.mul_(1.5)  # imperfect dynamics: the goal term has a gradient
+    actions = torch.randn(4, H + T, 2)
+    state = torch.cat([torch.zeros(4, 1, 2), actions[:, :-1].cumsum(1)], dim=1)
+    batch = model.encode({'state': state, 'action': actions})
+    # Context frames out of the graph: any encoder gradient comes through the goal.
+    emb = torch.cat([batch['emb'][:, :H].detach(), batch['emb'][:, H:]], 1)
+    search_loss(model, batch, emb, cfg).backward()
+    grad = model.encoder.weight.grad
+    reached = grad is not None and grad.abs().sum() > 0
+    assert reached == (not detach_goal)
+
+
+@pytest.mark.parametrize('anchor_detach', [True, False])
+def test_anchor_detach_flag(anchor_detach):
+    script = Path(__file__).resolve().parents[2] / 'scripts/train/lewm.py'
+    spec = importlib.util.spec_from_file_location('lewm_anchor_flag_test', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    torch.manual_seed(0)
+    H, T = 2, 3
+    cfg = OmegaConf.create(
+        {'wm': {'history_size': H}, 'loss': {'search': {'horizon': T, 'anchor_detach': anchor_detach}}}
+    )
+    model = LeWMState(encoder=_identity(2), predictor=_Predictor(), action_encoder=_identity(2))
+    with torch.no_grad():
+        model.action_encoder.weight.mul_(1.5)
+    actions = torch.randn(4, H + T, 2)
+    state = torch.cat([torch.zeros(4, 1, 2), actions[:, :-1].cumsum(1)], dim=1)
+    batch = model.encode({'state': state, 'action': actions})
+    emb = torch.cat([batch['emb'][:, :H].detach(), batch['emb'][:, H:]], 1)
+    module.search_anchor_loss(model, batch, emb, cfg).backward()
+    grad = model.encoder.weight.grad
+    assert (grad is not None and grad.abs().sum() > 0) == (not anchor_detach)
+
+
+def test_detach_goal_same_costs(search_loss):
+    """The undetached cost path gives exactly GoalMSE's values; only gradients differ."""
+    torch.manual_seed(0)
+    H, T = 2, 3
+    plan_costs = search_loss.__globals__['plan_costs']
+    cfg = OmegaConf.create({'wm': {'history_size': H}, 'loss': {'search': {'horizon': T, 'bptt': True}}})
+    model = LeWMState(encoder=_identity(2), predictor=_Predictor(), action_encoder=_identity(2))
+    actions = torch.randn(4, H + T, 2)
+    state = torch.cat([torch.zeros(4, 1, 2), actions[:, :-1].cumsum(1)], dim=1)
+    batch = model.encode({'state': state, 'action': actions})
+    plans = torch.randn(4, 6, T, 2)
+    fixed = plan_costs(model, batch, batch['emb'], cfg, plans)
+    cfg.loss.search.detach_goal = False
+    torch.testing.assert_close(plan_costs(model, batch, batch['emb'], cfg, plans), fixed)
