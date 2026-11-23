@@ -5,9 +5,14 @@
 Writes PNGs next to the inputs:
   feature_<name>.png  top: share of training windows vs eval tasks per bin;
                       bottom: planning success per bin (base / CEM / in-batch)
+  feature_<name>_by_g.png  the same, one column per goal offset g
   overview.png        the four main features side by side
   map.png             training windows over (T rotation, T displacement), eval
                       tasks on top, marked solved / failed by the in-batch model
+  map_by_g.png        the same, one panel per goal offset g
+The training-data share is g-matched: rotation and displacement grow with g and
+the dataset has fewer windows at large g, so the per-g shares are averaged with
+the eval tasks' g weights (pooled shares if the output predates per-g counts).
   similar.png         success vs how many training windows make the same move
 Model groups average their seeds: base = base_s*, CEM = cem_s*.
 --horizons 2 (or 2,3) plots success for those planning horizons only; the
@@ -31,6 +36,7 @@ SURFACE, INK, INK2, MUTED = '#fcfcfb', '#0b0b0b', '#52514e', '#898781'
 GRID, AXIS = '#e1e0d9', '#c3c2b7'
 DATA_BAR, EVAL_BAR = '#b5b3ab', '#52514e'
 SEQ = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b']
+MIN_TASKS = 5  # success points need at least this many tasks in the bin
 SELECTION = ''  # e.g. 'epoch 20 · planning horizon 2', set by load()
 GROUPS = [  # (label, csv run-name prefix, color); fixed order = fixed colors
     ('in-batch negatives', 'inbatch', '#2a78d6'),
@@ -99,15 +105,28 @@ def success_by_bin(tasks, key, edges, label):
     return out
 
 
-def feature_panels(ax_top, ax_bot, tasks, meta, groups, key, title_on=True):
+def shares(meta, key, g=None):
+    """(training-data %, eval-task %, data label) per bin: at one g, or g-matched over all g."""
+    norm = lambda v: 100 * np.asarray(v, float) / max(1, np.sum(v))  # noqa: E731
+    if g is not None:
+        return norm(meta['hist_by_g'][key][str(g)]['all']), norm(meta['eval_hist_by_g'][key].get(str(g), [0])), 'training data'
+    ev = norm(meta['eval_hist'][key])
+    if 'hist_by_g' not in meta:
+        return norm(meta['hist'][key]['all']), ev, 'training data (pooled over g)'
+    data = sum(w * norm(meta['hist_by_g'][key][gg]['all']) for gg, w in meta['g_weight'].items())
+    return data, ev, 'training data (same g mix as eval)'
+
+
+def feature_panels(ax_top, ax_bot, tasks, meta, groups, key, title_on=True, g=None):
     edges = meta['bins'][key]
     title, xlabel, fmt = FEATURES[key]
     labels = bin_labels(edges, fmt)
     x = np.arange(len(labels))
-    data = 100 * np.array(meta['hist'][key]['all']) / max(1, sum(meta['hist'][key]['all']))
-    ev = 100 * np.array(meta['eval_hist'][key]) / max(1, sum(meta['eval_hist'][key]))
+    if g is not None:
+        tasks = [t for t in tasks if int(t['g']) == g]
+    data, ev, data_label = shares(meta, key, g)
     w = 0.36
-    ax_top.bar(x - w / 2 - 0.01, data, w, color=DATA_BAR, label='training data (windows)')
+    ax_top.bar(x - w / 2 - 0.01, data, w, color=DATA_BAR, label=data_label)
     ax_top.bar(x + w / 2 + 0.01, ev, w, color=EVAL_BAR, label='eval tasks')
     ax_top.set_ylabel('share (%)', color=INK2, fontsize=9)
     if title_on:
@@ -118,26 +137,28 @@ def feature_panels(ax_top, ax_bot, tasks, meta, groups, key, title_on=True):
     style(ax_top)
     ax_top.set_xticks(x, [])
     ax_top.set_ylim(0, max(data.max(), ev.max()) * 1.22)
+    n = [c for _, c in success_by_bin(tasks, key, edges, groups[0][0])]
     for label, color, _ in groups:
-        s = np.array([v for v, _ in success_by_bin(tasks, key, edges, label)])
-        ax_bot.plot(x, s, color=color, linewidth=2, marker='o', markersize=6,
+        sb = success_by_bin(tasks, key, edges, label)
+        # Bins with fewer than MIN_TASKS tasks are too noisy to draw (one task = 0 or 100%).
+        y = np.array([v if c >= MIN_TASKS else np.nan for v, c in sb])
+        ax_bot.plot(x, y, color=color, linewidth=2, marker='o', markersize=6,
                     markeredgecolor=SURFACE, markeredgewidth=1.5, label=label)
     ax_bot.set_ylabel('planning success (%)', color=INK2, fontsize=9)
     ax_bot.set_xlabel(xlabel, color=INK2, fontsize=9)
-    ax_bot.set_xticks(x, labels)
+    ax_bot.set_xticks(x, [f'{lab}\n{c} task{"s" if c != 1 else ""}' for lab, c in zip(labels, n)])
+    for tick, c in zip(ax_bot.get_xticklabels(), n):
+        tick.set_color(INK2 if c >= MIN_TASKS else MUTED)
     ax_bot.set_ylim(0, 100)
     style(ax_bot)
-    n = [c for _, c in success_by_bin(tasks, key, edges, groups[0][0])]
-    for i, c in enumerate(n):
-        ax_bot.text(i, 96, f'{c} tasks', ha='center', va='top', fontsize=7, color=MUTED)
 
 
 def direct_labels(ax, tasks, key, edges, groups):
     """Name each line at its last point, nudged apart."""
     ends = []
     for label, color, _ in groups:
-        s = [v for v, _ in success_by_bin(tasks, key, edges, label)]
-        ends.append([s[-1], label])
+        s = [v for v, c in success_by_bin(tasks, key, edges, label) if c >= MIN_TASKS]
+        ends.append([s[-1] if s else 50.0, label])
     ends.sort()
     for i in range(1, len(ends)):
         ends[i][0] = max(ends[i][0], ends[i - 1][0] + 6)
@@ -170,6 +191,72 @@ def plot_feature(tasks, meta, groups, key, out):
     plt.close(fig)
 
 
+def plot_feature_by_g(tasks, meta, groups, key, out):
+    offsets = meta['offsets']
+    fig, axes = plt.subplots(2, len(offsets), figsize=(3.6 * len(offsets), 5.8), sharey='row',
+                             gridspec_kw={'height_ratios': [1, 1.25]})
+    fig.patch.set_facecolor(SURFACE)
+    top = 0
+    for j, g in enumerate(offsets):
+        feature_panels(axes[0, j], axes[1, j], tasks, meta, groups, key, title_on=False, g=g)
+        axes[0, j].set_title(f'goal offset g = {g}', color=INK, fontsize=10, loc='left')
+        top = max(top, axes[0, j].get_ylim()[1])
+        if j:
+            axes[0, j].set_ylabel('')
+            axes[1, j].set_ylabel('')
+            axes[0, j].get_legend() and axes[0, j].get_legend().remove()
+    for j in range(len(offsets)):
+        axes[0, j].set_ylim(0, top)
+    title = FEATURES[key][0]
+    fig.suptitle(f'{title}, per goal offset', x=0.01, ha='left', color=INK, fontsize=11)
+    fig.text(0.01, 0.935, f'{SELECTION} · success not drawn for bins with fewer than {MIN_TASKS} tasks',
+             fontsize=8, color=MUTED)
+    legend(fig, axes[0, 0], groups)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+    fig.savefig(out, dpi=160, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def plot_map_by_g(tasks, meta, out, solver):
+    edges = meta['map']['edges']
+    ex, ey = np.degrees(edges['dyaw']), np.array(edges['dxy'])
+    offsets = meta['offsets']
+    shares_g = {g: 100 * np.array(meta['map']['by_g'][str(g)]) / max(1, np.sum(meta['map']['by_g'][str(g)])) for g in offsets}
+    pos = np.concatenate([v[v > 0] for v in shares_g.values()])
+    norm = LogNorm(vmin=max(pos.min(), 1e-4), vmax=pos.max())
+    cmap = LinearSegmentedColormap.from_list('seq', SEQ)
+    cmap.set_bad(SURFACE)
+    fig, axes = plt.subplots(1, len(offsets), figsize=(3.9 * len(offsets), 4.4), sharey=True)
+    fig.patch.set_facecolor(SURFACE)
+    for ax, g in zip(axes, offsets):
+        mesh = ax.pcolormesh(ex, ey, np.ma.masked_equal(shares_g[g], 0).T, cmap=cmap, norm=norm, shading='flat')
+        tg = [t for t in tasks if int(t['g']) == g]
+        s = np.array([t[solver] for t in tg])
+        x = np.degrees([t['dyaw'] for t in tg])
+        y = np.minimum([t['dxy'] for t in tg], ey[-1] - 2)
+        good = s >= 0.5
+        ax.scatter(x[good], y[good], s=26, facecolor=SURFACE, edgecolor=INK, linewidth=1.2, zorder=3,
+                   label=f'{solver} solves >= 50%')
+        ax.scatter(x[~good], y[~good], s=24, marker='x', color=INK, linewidth=1.3, zorder=3,
+                   label=f'{solver} solves < 50%')
+        ax.set_title(f'goal offset g = {g}  ({good.sum()} solved / {(~good).sum()} failed)', color=INK, fontsize=9.5, loc='left')
+        ax.set_xlabel('T rotation (degrees)', color=INK2, fontsize=9)
+        style(ax)
+        ax.grid(False)
+        ax.set_ylim(0, ey[-1])
+    axes[0].set_ylabel('T displacement (mm)', color=INK2, fontsize=9)
+    axes[0].legend(loc='upper right', frameon=True, facecolor=SURFACE, edgecolor=GRID, fontsize=7.5, labelcolor=INK2)
+    fig.subplots_adjust(left=0.05, right=0.9, top=0.8, bottom=0.14, wspace=0.08)
+    cb = fig.colorbar(mesh, cax=fig.add_axes([0.915, 0.14, 0.01, 0.66]))
+    cb.set_label('training windows at this g (% per cell, log)', color=INK2, fontsize=8.5)
+    cb.ax.tick_params(colors=INK2, labelsize=8, length=0)
+    cb.outline.set_visible(False)
+    fig.suptitle('Where the eval tasks sit in the training data, per goal offset', x=0.01, ha='left', color=INK, fontsize=11)
+    fig.text(0.01, 0.91, SELECTION, fontsize=8, color=MUTED)
+    fig.savefig(out, dpi=160, facecolor=SURFACE)
+    plt.close(fig)
+
+
 def plot_overview(tasks, meta, groups, out):
     keys = list(FEATURES)
     fig, axes = plt.subplots(2, len(keys), figsize=(4.2 * len(keys), 5.8), gridspec_kw={'height_ratios': [1, 1.25]})
@@ -188,7 +275,13 @@ def plot_overview(tasks, meta, groups, out):
 def plot_map(tasks, meta, out, solver):
     edges, counts = meta['map']['edges'], np.array(meta['map']['counts'])
     ex, ey = np.degrees(edges['dyaw']), np.array(edges['dxy'])
-    share = 100 * counts / counts.sum()
+    if 'by_g' in meta['map']:  # g-matched: per-g shares weighted like the eval tasks' g mix
+        share = sum(w * 100 * np.array(meta['map']['by_g'][g]) / max(1, np.sum(meta['map']['by_g'][g]))
+                    for g, w in meta['g_weight'].items())
+        cb_label = 'training windows, same g mix as eval (% per cell, log)'
+    else:
+        share = 100 * counts / counts.sum()
+        cb_label = 'training windows (% per cell, log)'
     fig, ax = plt.subplots(figsize=(7.5, 5.2))
     fig.patch.set_facecolor(SURFACE)
     cmap = LinearSegmentedColormap.from_list('seq', SEQ)
@@ -197,7 +290,7 @@ def plot_map(tasks, meta, out, solver):
     mesh = ax.pcolormesh(ex, ey, np.ma.masked_equal(share, 0).T, cmap=cmap,
                          norm=LogNorm(vmin=max(pos.min(), 1e-4), vmax=pos.max()), shading='flat')
     cb = fig.colorbar(mesh, ax=ax, pad=0.02)
-    cb.set_label('training windows (% per cell, log)', color=INK2, fontsize=9)
+    cb.set_label(cb_label, color=INK2, fontsize=9)
     cb.ax.tick_params(colors=INK2, labelsize=8, length=0)
     cb.outline.set_visible(False)
     s = np.array([t[solver] for t in tasks])
@@ -274,8 +367,12 @@ def main():
     plt.rcParams['font.family'] = ['DejaVu Sans']
     for k in FEATURES:
         plot_feature(tasks, meta, groups, k, args.folder / f'feature_{k}{sfx}.png')
+        if 'hist_by_g' in meta:
+            plot_feature_by_g(tasks, meta, groups, k, args.folder / f'feature_{k}_by_g{sfx}.png')
     plot_overview(tasks, meta, groups, args.folder / f'overview{sfx}.png')
     plot_map(tasks, meta, args.folder / f'map{sfx}.png', groups[0][0])
+    if 'by_g' in meta['map']:
+        plot_map_by_g(tasks, meta, args.folder / f'map_by_g{sfx}.png', groups[0][0])
     plot_similar(tasks, groups, args.folder / f'similar{sfx}.png', args.similar)
     print(f'wrote figures to {args.folder}')
 

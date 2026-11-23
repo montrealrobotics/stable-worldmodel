@@ -18,7 +18,13 @@ Per eval task (seed, g), from the expert goal cache:
   success_<run>_h<k> the same for planning horizon k only (plot_task_coverage.py --horizons)
 Counts are split into expert / replay episodes (episode table replay_idx).
 
-Writes to --out: tasks.csv, windows.json (bin edges + counts), summary.md.
+Rotation and displacement grow with g, and the eval tasks and the dataset
+mix g differently (windows: fewer at large g; tasks: ~equal per g), so every
+count is also kept per g and the data share is reported g-matched: the
+per-g shares averaged with the eval tasks' g weights.
+
+Writes to --out: tasks.csv, windows.json (bin edges + counts, pooled and per
+g), summary.md.
 Plot with scripts/data/plot_task_coverage.py. Run on Mila (CPU job:
 scripts/cluv/dataset_task_coverage.sbatch).
 """
@@ -157,15 +163,21 @@ def main():
     eval_hist = {k: np.zeros(len(e) - 1) for k, e in BINS.items()}
     map_counts = np.zeros((len(MAP_EDGES['dyaw']) - 1, len(MAP_EDGES['dxy']) - 1))
     n_windows = {'all': 0, 'expert': 0}
+    hist_g, eval_hist_g, map_g, windows_g = {}, {}, {}, {}  # per g (str keys for JSON)
     for g in offsets:
         t, f = window_features(d, g)
         exp = d['expert'][t]
         n_windows['all'] += len(t)
         n_windows['expert'] += int(exp.sum())
+        windows_g[str(g)] = {'all': len(t), 'expert': int(exp.sum())}
         for k, edges in BINS.items():
-            hist[k]['all'] += np.histogram(f[k], edges)[0]
-            hist[k]['expert'] += np.histogram(f[k][exp], edges)[0]
-        map_counts += np.histogram2d(f['dyaw'], f['dxy'], [MAP_EDGES['dyaw'], MAP_EDGES['dxy']])[0]  # > 200 mm left out
+            h_all, h_exp = np.histogram(f[k], edges)[0], np.histogram(f[k][exp], edges)[0]
+            hist[k]['all'] += h_all
+            hist[k]['expert'] += h_exp
+            hist_g.setdefault(k, {})[str(g)] = {'all': h_all.tolist(), 'expert': h_exp.tolist()}
+        m = np.histogram2d(f['dyaw'], f['dxy'], [MAP_EDGES['dyaw'], MAP_EDGES['dxy']])[0]  # > 200 mm left out
+        map_counts += m
+        map_g[str(g)] = m.tolist()
         # Start + goal T pose of every window, in tolerance units (8D).
         win_tree = cKDTree(np.concatenate([tee_embed(d['obj'][t]), tee_embed(d['obj'][t + g])], 1))
         for (seed, gg), task in tasks.items():
@@ -188,7 +200,18 @@ def main():
         print(f'g={g}: {len(t):,} windows')
     for task in tasks.values():
         for k, e in BINS.items():
-            eval_hist[k] += np.histogram([task[k]], e)[0]
+            h = np.histogram([task[k]], e)[0]
+            eval_hist[k] += h
+            eg = eval_hist_g.setdefault(k, {}).setdefault(str(task['g']), np.zeros(len(e) - 1))
+            eg += h
+    eval_hist_g = {k: {g: v.tolist() for g, v in hg.items()} for k, hg in eval_hist_g.items()}
+    # g-matched data share: per-g shares weighted like the eval tasks' g mix
+    g_weight = {str(g): sum(1 for _, gg in tasks if gg == g) / len(tasks) for g in offsets}
+
+    def matched(k, split):
+        return sum(
+            g_weight[g] * np.array(hist_g[k][g][split]) / max(1, windows_g[g][split]) for g in g_weight
+        )
 
     # tasks.csv
     feats = ['dyaw', 'dxy', 'path_xy', 'deef', 'eef_T_start', 'eef_T_goal', 'goal_step', 'moved']
@@ -224,7 +247,11 @@ def main():
             'bins': {k: as_list(e) for k, e in BINS.items()},
             'hist': {k: {s: v.tolist() for s, v in h.items()} for k, h in hist.items()},
             'eval_hist': {k: v.tolist() for k, v in eval_hist.items()},
-            'map': {'edges': MAP_EDGES, 'counts': map_counts.tolist()},
+            'map': {'edges': MAP_EDGES, 'counts': map_counts.tolist(), 'by_g': map_g},
+            'hist_by_g': hist_g,
+            'eval_hist_by_g': eval_hist_g,
+            'windows_by_g': windows_g,
+            'g_weight': g_weight,
         },
         open(out / 'windows.json', 'w'),
         indent=1,
@@ -241,17 +268,27 @@ def main():
         '',
     ]
     for k, edges in BINS.items():
-        lines += [f'## {k}', '', '| bin | data % | expert data % | eval tasks % | ' + ' | '.join(names) + ' |',
-                  '|---|---|---|---|' + '---|' * len(names)]
+        lines += [f'## {k}', '', '| bin | data % (g-matched) | expert data % (g-matched) | data % (pooled) | eval tasks % | '
+                  + ' | '.join(names) + ' |', '|---|---|---|---|---|' + '---|' * len(names)]
+        m_all, m_exp = matched(k, 'all'), matched(k, 'expert')
         for i in range(len(edges) - 1):
             lo, hi = edges[i], edges[i + 1]
             sel = [t for t in tasks.values() if lo <= t[k] < hi]
             succ = [f'{100 * np.mean([np.mean(t["_ok"][n]) for t in sel if n in t["_ok"]]):.1f}' if sel else '–' for n in names]
             lines.append(
-                f'| {lo:g}–{hi:g} | {100 * hist[k]["all"][i] / n_windows["all"]:.1f} | '
-                f'{100 * hist[k]["expert"][i] / max(1, n_windows["expert"]):.1f} | '
+                f'| {lo:g}–{hi:g} | {100 * m_all[i]:.1f} | {100 * m_exp[i]:.1f} | '
+                f'{100 * hist[k]["all"][i] / n_windows["all"]:.1f} | '
                 f'{100 * eval_hist[k][i] / len(tasks):.1f} | ' + ' | '.join(succ) + ' |'
             )
+        lines.append('')
+    lines += ['## Per goal offset g: data % / eval tasks % per bin', '']
+    for k, edges in BINS.items():
+        lines += [f'### {k}', '', '| g | ' + ' | '.join(f'{edges[i]:g}–{edges[i + 1]:g}' for i in range(len(edges) - 1)) + ' |',
+                  '|---|' + '---|' * (len(edges) - 1)]
+        for g in offsets:
+            dg = np.array(hist_g[k][str(g)]['all']) / max(1, windows_g[str(g)]['all'])
+            eg = np.array(eval_hist_g[k].get(str(g), np.zeros(len(edges) - 1))) / max(1, sum(1 for _, gg in tasks if gg == g))
+            lines.append(f'| {g} | ' + ' | '.join(f'{100 * a:.0f} / {100 * b:.0f}' for a, b in zip(dg, eg)) + ' |')
         lines.append('')
     sim = np.array([t['similar_windows'] for t in tasks.values()])
     lines += [
