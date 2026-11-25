@@ -1,0 +1,9 @@
+# Oracle-style planning cost: probed pose error instead of the embedding distance.
+# probe_path: a <label>.pt from scripts/plan/fit_pose_probe.py, fit on the same checkpoint.
+# eval_wm.py runs from scripts/plan, so the module imports as `pose_probe`.
+_target_: pose_probe.PoseProbeCost
+probe_path: ???
+txy_tol_mm: 20.0
+yaw_tol_rad: 0.15
+eef_tol_mm: 20.0
+eef_weight: 1.0
