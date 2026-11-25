@@ -42,20 +42,28 @@ def named_observation_leaves(obs):
     return leaves
 
 
-def policy_observation(obs, device, policy_type):
-    """Match RGB-only FlattenRGBDObservationWrapper without mutating stored observations."""
+def policy_observation(obs, device, policy_type, cameras=None):
+    """Match RGB-only FlattenRGBDObservationWrapper without mutating stored observations.
+
+    `cameras` restricts the RGB input to those sensors, in that order (e.g. the
+    policy's training cameras when extra sensors are rendered only for saving);
+    None uses every sensor in `sensor_data`.
+    """
     if policy_type == 'state':
         return flatten_policy_state(obs, device)
     if policy_type != 'rgb':
         raise ValueError(f'Unknown policy type: {policy_type}')
     import torch
 
+    sensors = obs['sensor_data']
+    names = list(sensors) if cameras is None else list(cameras)
+    missing = [name for name in names if name not in sensors]
+    if missing:
+        raise ValueError(
+            f'Policy cameras {missing} not in sensor_data: {list(sensors)}'
+        )
     return {
         'rgb': torch.cat(
-            [
-                camera['rgb'].to(device)
-                for camera in obs['sensor_data'].values()
-            ],
-            dim=-1,
+            [sensors[name]['rgb'].to(device) for name in names], dim=-1
         )
     }

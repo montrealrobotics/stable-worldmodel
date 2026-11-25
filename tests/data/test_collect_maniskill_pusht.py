@@ -116,6 +116,22 @@ class CollectionTests(unittest.TestCase):
         self.assertIn('sensor_data', obs)
         self.assertEqual(len(named_observation_leaves(obs)), 2)
 
+    def test_rgb_policy_cameras_exclude_saved_only_sensors(self):
+        overhead = torch.full((1, 2, 2, 3), 7, dtype=torch.uint8)
+        base = torch.zeros((1, 2, 2, 3), dtype=torch.uint8)
+        obs = {
+            'sensor_data': {
+                'overhead_camera': {'rgb': overhead},
+                'base_camera': {'rgb': base},
+            }
+        }
+        actual = policy_observation(obs, 'cpu', 'rgb', ['overhead_camera'])
+        torch.testing.assert_close(actual['rgb'], overhead)
+        both = policy_observation(obs, 'cpu', 'rgb')
+        self.assertEqual(both['rgb'].shape[-1], 6)
+        with self.assertRaises(ValueError):
+            policy_observation(obs, 'cpu', 'rgb', ['missing'])
+
     def test_rgb_xy_rollout_and_clipping(self):
         from types import SimpleNamespace
 

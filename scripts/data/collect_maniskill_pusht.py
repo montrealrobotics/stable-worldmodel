@@ -236,14 +236,34 @@ def parse_args():
         min_std=0.1,
         max_std=0.5,
     )
+    # Saving a camera other than the RGB policy's training camera (e.g. the
+    # stock base_camera while the policy sees overhead_camera) leaves the
+    # policy input untouched, so --camera-name/--image-size may then differ.
+    saves_other_camera = (
+        args.camera_name is not None
+        and 'camera_name' in inferred
+        and args.camera_name != inferred['camera_name']
+    )
     for key, fallback in defaults.items():
         value = getattr(args, key)
-        if key in inferred and value is not None and value != inferred[key]:
+        if saves_other_camera and key in ('camera_name', 'image_size'):
+            inferred_value = None
+        else:
+            inferred_value = inferred.get(key)
+        if (
+            inferred_value is not None
+            and value is not None
+            and value != inferred_value
+        ):
             parser.error(
                 f'--{key.replace("_", "-")} conflicts with checkpoint training_config.json'
             )
         setattr(
-            args, key, inferred.get(key, fallback) if value is None else value
+            args,
+            key,
+            (fallback if inferred_value is None else inferred_value)
+            if value is None
+            else value,
         )
     for name in (
         'num_episodes',
@@ -369,6 +389,7 @@ def collect_episode(
     noise_std=0.0,
     noise_hold_steps=5,
     policy_type='state',
+    policy_cameras=None,
     save_rgb=True,
 ):
     import numpy as np
@@ -404,7 +425,9 @@ def collect_episode(
                     f'Unknown sensor {camera_name!r}; available: {list(sensors)}'
                 )
             pixels = as_numpy(sensors[camera_name]['rgb'])
-        policy_input = policy_observation(obs, device, policy_type)
+        policy_input = policy_observation(
+            obs, device, policy_type, policy_cameras
+        )
         sim_state = as_numpy(env.unwrapped.get_state())
         leaves = named_observation_leaves(obs)
         if tuple(leaves) != observation_keys:
@@ -487,6 +510,7 @@ def collect_episode_batch(
     noise_std=0.0,
     noise_hold_steps=5,
     policy_type='state',
+    policy_cameras=None,
     save_rgb=True,
     replay_actions=None,
     replay_lengths=None,
@@ -594,7 +618,9 @@ def collect_episode_batch(
                     or pixels.dtype != torch.uint8
                 ):
                     raise ValueError('Expected camera RGB uint8 [N,H,W,3]')
-            policy_input = policy_observation(obs, device, policy_type)
+            policy_input = policy_observation(
+                obs, device, policy_type, policy_cameras
+            )
             action = torch.empty(
                 (count, *env.single_action_space.shape), device=device
             )
@@ -752,6 +778,7 @@ def collect_correct_chunk_batch(
     std_scales,
     tolerance,
     policy_type='state',
+    policy_cameras=None,
     save_rgb=True,
     noise_seed=0,
 ):
@@ -826,7 +853,9 @@ def collect_correct_chunk_batch(
                         )
                     values['pixels'] = sensors[camera_name]['rgb']
                 mean = agent.get_action(
-                    policy_observation(obs, device, policy_type),
+                    policy_observation(
+                        obs, device, policy_type, policy_cameras
+                    ),
                     deterministic=True,
                 )
                 noise = torch.randn(
@@ -1005,6 +1034,16 @@ def main():
     validate_collection_checkpoint(weights, args.policy_type)
     _, training_config = collection_defaults(args.checkpoint)
     sensor_configs = {'width': args.image_size, 'height': args.image_size}
+    policy_cameras = None
+    env_kwargs = {}
+    if (
+        args.env_id == 'OverheadPushT-v1'
+        and args.save_rgb
+        and args.camera_name == 'base_camera'
+    ):
+        # Render ManiSkill's stock PushT camera (original extrinsic) for the
+        # dataset; RGB policies still receive only their training cameras.
+        env_kwargs['include_base_camera'] = True
     if training_config and args.policy_type == 'rgb':
         import sapien
 
@@ -1015,6 +1054,12 @@ def main():
             if pose is not None:
                 settings['pose'] = sapien.Pose(p=pose['p'], q=pose['q'])
             sensor_configs[name] = settings
+        policy_cameras = list(sensor_configs)
+        if args.save_rgb and args.camera_name not in sensor_configs:
+            sensor_configs[args.camera_name] = {
+                'width': args.image_size,
+                'height': args.image_size,
+            }
     # Correct chunks and alternatives run groups of candidates per expert
     # episode; spare groups in the last batch are collected and discarded.
     in_groups = bool(args.correct_chunks or args.alternatives)
@@ -1037,6 +1082,7 @@ def main():
         reward_mode=args.reward_mode,
         reconfiguration_freq=args.reconfiguration_freq,
         sensor_configs=sensor_configs,
+        **env_kwargs,
     )
     try:
         if isinstance(env.action_space, gym.spaces.Dict):
@@ -1093,7 +1139,9 @@ def main():
 
             agent = RGBExpert(
                 env,
-                sample_obs=policy_observation(initial_obs, device, 'rgb'),
+                sample_obs=policy_observation(
+                    initial_obs, device, 'rgb', policy_cameras
+                ),
                 encoder=args.encoder,
                 std_mode=args.std_mode,
                 initial_std=args.initial_std,
@@ -1147,6 +1195,7 @@ def main():
                             std_scales=args.chunk_std_scales,
                             tolerance=TOLERANCES[args.chunk_tolerance],
                             policy_type=args.policy_type,
+                            policy_cameras=policy_cameras,
                             save_rgb=args.save_rgb,
                             noise_seed=args.seed + start,
                         )[:count]
@@ -1167,6 +1216,7 @@ def main():
                             noise_std=args.noise_std,
                             noise_hold_steps=args.noise_hold_steps,
                             policy_type=args.policy_type,
+                            policy_cameras=policy_cameras,
                             save_rgb=args.save_rgb,
                             noise_seed=args.seed + start,
                             sources=[i // n * n for i in range(num_envs)],
@@ -1191,6 +1241,7 @@ def main():
                             'noise_std': args.noise_std,
                             'noise_hold_steps': args.noise_hold_steps,
                             'policy_type': args.policy_type,
+                            'policy_cameras': policy_cameras,
                             'save_rgb': args.save_rgb,
                         }
                         batch = collect_episode_batch(
@@ -1350,7 +1401,8 @@ def main():
                 include_state=False,
                 frame_stack=1,
                 action_repeat=1,
-                policy_cameras=list(initial_obs['sensor_data']),
+                policy_cameras=policy_cameras
+                or list(initial_obs['sensor_data']),
             )
         metadata_path = args.output_path.with_suffix('.collection.json')
         metadata_path.write_text(json.dumps(metadata, indent=2) + '\n')

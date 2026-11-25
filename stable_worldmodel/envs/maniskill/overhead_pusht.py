@@ -18,6 +18,13 @@ class OverheadPushTEnv(PushTEnv):
     # Slate blue contrasts with the white robot and the red/green task objects.
     TABLE_COLOR = np.array([0.12, 0.20, 0.28, 1.0], dtype=np.float32)
 
+    def __init__(self, *args, include_base_camera=False, **kwargs):
+        # Opt-in: also render ManiSkill's stock PushT `base_camera` (original
+        # extrinsic) as a sensor, e.g. to save it while the policy sees only
+        # the overhead view. Off by default so sensor_data stays overhead-only.
+        self.include_base_camera = include_base_camera
+        super().__init__(*args, **kwargs)
+
     def reset(self, *args, **kwargs):
         result = super().reset(*args, **kwargs)
         options = kwargs.get('options') or {}
@@ -130,6 +137,11 @@ class OverheadPushTEnv(PushTEnv):
 
     @property
     def _default_sensor_configs(self):
+        base = (
+            list(super()._default_sensor_configs)
+            if self.include_base_camera
+            else []
+        )
         return [
             CameraConfig(
                 uid='overhead_camera',
@@ -146,4 +158,4 @@ class OverheadPushTEnv(PushTEnv):
                 near=0.01,
                 far=10,
             )
-        ]
+        ] + base
