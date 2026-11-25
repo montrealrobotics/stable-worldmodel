@@ -1,5 +1,6 @@
 import math
 import os
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import stable_pretraining as spt
 import torch
 import torch._functorch.config
 import torch.nn.functional as F
+from torch import nn
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
@@ -175,6 +177,32 @@ def slice_clips(batch, frames=None, clips=None):
                 v = v[:, :frames]
         out[k] = v
     return out
+
+
+@contextmanager
+def batchnorm_eval(model, enabled=True):
+    """Run the model's BatchNorm layers in eval mode inside the block.
+
+    The search loss rolls out dozens of mostly deliberately bad plans per clip.
+    In train mode, BatchNorm would normalize each plan with statistics of those
+    negatives (so a plan's cost depends on the others in the batch) and fold
+    every rollout, CEM rounds included, into the running statistics the planner
+    uses at eval. In eval mode it applies the running statistics instead: the
+    same cost as at planning time, and the statistics are left to the main
+    batch. Gradients still reach the affine parameters. Other modules
+    (dropout) keep their mode; each layer's previous mode is restored.
+    """
+    layers = [
+        m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)
+    ] if enabled else []
+    modes = [m.training for m in layers]
+    for m in layers:
+        m.eval()
+    try:
+        yield
+    finally:
+        for m, mode in zip(layers, modes):
+            m.train(mode)
 
 
 def search_batch(batch, emb, cfg):
@@ -346,8 +374,9 @@ def search_loss(model, batch, emb, cfg):
     search = cfg.loss.search
     all_steps = search.get('all_steps', False)
     batch, emb = search_batch(batch, emb, cfg)
-    plans = search_negatives(model, batch, emb, cfg)
-    costs = plan_costs(model, batch, emb, cfg, plans, all_steps)  # expert 0
+    with batchnorm_eval(model, search.get('bn_eval', False)):
+        plans = search_negatives(model, batch, emb, cfg)
+        costs = plan_costs(model, batch, emb, cfg, plans, all_steps)  # expert 0
     if all_steps:  # one InfoNCE per step: (B, S, T) -> (B * T, S)
         costs = costs.transpose(1, 2).flatten(0, 1)
     target = costs.new_zeros(costs.size(0), dtype=torch.long)
@@ -374,7 +403,8 @@ def search_anchor_loss(model, batch, emb, cfg):
     }
     info['emb'] = emb[:, None, :H]
     info['action_history'] = batch['action'][:, None, : H - 1]
-    pred = model.rollout(info, expert, H)['predicted_emb'][:, 0, H:]
+    with batchnorm_eval(model, cfg.loss.search.get('bn_eval', False)):
+        pred = model.rollout(info, expert, H)['predicted_emb'][:, 0, H:]
     target = emb[:, H : H + T]
     if cfg.loss.search.get('anchor_detach', True):  # false: the encoder also moves toward the rollout
         target = target.detach()

@@ -56,6 +56,10 @@ loss:
     # CEM elites are still chosen by the last-step cost. Without bptt each
     # step gets only its one-step gradient (detached prefix).
     all_steps: false
+    # true: BatchNorm layers run in eval mode (running statistics) inside the
+    # search / anchor losses, so plan costs match planning and the negatives'
+    # rollouts do not update the running statistics. No effect without BN.
+    bn_eval: false
   gfn:
     num_samples: 56 # negatives per clip (CEM uses 16 perturbed + 40 elites)
     explore_std: 1.5 # widen sampling for exploration; TB stays exact

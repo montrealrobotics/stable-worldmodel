@@ -449,3 +449,72 @@ def test_detach_goal_same_costs(search_loss):
     fixed = plan_costs(model, batch, batch['emb'], cfg, plans)
     cfg.loss.search.detach_goal = False
     torch.testing.assert_close(plan_costs(model, batch, batch['emb'], cfg, plans), fixed)
+
+
+@pytest.mark.parametrize('bn_eval', [False, True])
+def test_bn_eval_flag(bn_eval):
+    """bn_eval: BatchNorm in the rollout uses running statistics inside the search
+    loss (costs equal an eval-mode model's), leaves them unchanged, still trains
+    the affine weights, and returns to train mode. Off: the negatives' rollouts
+    update the running statistics."""
+    pytest.importorskip('stable_pretraining')
+    script = Path(__file__).resolve().parents[2] / 'scripts/train/lewm.py'
+    spec = importlib.util.spec_from_file_location('lewm_bn_eval_test', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    torch.manual_seed(0)
+    H, T, B = 2, 3, 6
+    cfg = OmegaConf.create(
+        {
+            'wm': {'history_size': H},
+            'loss': {
+                'search': {
+                    'horizon': T,
+                    'bptt': True,
+                    'cem_steps': 2,
+                    'num_samples': 8,
+                    'topk': 2,
+                    'num_perturbed': 3,
+                    'perturb_std': 0.5,
+                    'var_scale': 1.0,
+                    'temperature': 1.0,
+                    'bn_eval': bn_eval,
+                    'anchor_weight': 1.0,
+                }
+            },
+        }
+    )
+    model = LeWMState(
+        encoder=_identity(2),
+        predictor=_Predictor(),
+        action_encoder=_identity(2),
+        pred_proj=nn.BatchNorm1d(2),
+    )
+    bn = model.pred_proj
+    bn.running_mean.fill_(0.3)
+    bn.running_var.fill_(2.0)
+    model.train()
+    actions = torch.randn(B, H + T, 2)
+    state = torch.cat([torch.zeros(B, 1, 2), actions[:, :-1].cumsum(1)], dim=1)
+    batch = model.encode({'state': state, 'action': actions})
+    stats = (bn.running_mean.clone(), bn.running_var.clone())
+
+    torch.manual_seed(1)
+    loss = module.search_loss(model, batch, batch['emb'], cfg)
+    anchor = module.search_anchor_loss(model, batch, batch['emb'], cfg)
+    (loss + anchor).backward()
+    assert bn.training and model.training
+    unchanged = torch.equal(bn.running_mean, stats[0]) and torch.equal(
+        bn.running_var, stats[1]
+    )
+    assert unchanged == bn_eval
+    assert bn.weight.grad.abs().sum() > 0
+
+    if bn_eval:  # same costs as a fully eval-mode model, i.e. as in planning
+        plans = torch.randn(B, 5, T, 2)
+        with module.batchnorm_eval(model):
+            costs = module.plan_costs(model, batch, batch['emb'], cfg, plans)
+        model.eval()
+        ref = module.plan_costs(model, batch, batch['emb'], cfg, plans)
+        model.train()
+        torch.testing.assert_close(costs, ref)
