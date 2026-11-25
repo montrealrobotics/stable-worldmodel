@@ -1098,6 +1098,14 @@ def main():
         # StateExpert only needs the state/action spaces to rebuild the PPO MLP.
         # Use the actual flattened observation to size the checkpoint's MLP.
         initial_obs, _ = env.reset(seed=args.seed)
+        if policy_cameras is None and env_kwargs.get('include_base_camera'):
+            # Without a training config the policy cameras are unknown; the
+            # env's own sensors are the policy's, base_camera is saved only.
+            policy_cameras = [
+                name
+                for name in initial_obs['sensor_data']
+                if name != 'base_camera'
+            ]
         if training_config:
             saved_env = training_config['environment']
             if (
