@@ -9,7 +9,7 @@ set -euo pipefail
 
 # Re-render a dataset's frames from its saved states (scripts/data/rerender_pusht_dataset.py).
 # Args: <source .lance> <output name> [rerender options]. Writes and archives on
-# $SLURM_TMPDIR, then copies the dataset, episodes table, JSON and .tar.gz to DEST_DIR.
+# $SLURM_TMPDIR, then copies the .tar.gz and collection JSON to DEST_DIR.
 #   cluv submit mila scripts/cluv/rerender_pusht_dataset.sbatch -- \
 #     /network/scratch/o/ozgur.aslan/le-wm/datasets/overhead_rgb_noisy_replay_100k.lance \
 #     basecam_fov1_noisy_replay_100k --camera-fov 1.0
@@ -18,7 +18,7 @@ NAME="${2:?Pass the output dataset name (no .lance) as the second argument}"
 shift 2
 DEST_DIR=/network/scratch/o/ozgur.aslan/le-wm/datasets
 PROJECT_DIR="$PWD"
-[[ ! -e "$DEST_DIR/$NAME.lance" ]] || { echo "$DEST_DIR/$NAME.lance exists" >&2; exit 1; }
+[[ ! -e "$DEST_DIR/$NAME.lance.tar.gz" ]] || { echo "$DEST_DIR/$NAME.lance.tar.gz exists" >&2; exit 1; }
 
 module load cuda/12.6.0/cudnn/9.3
 module load anaconda/3
