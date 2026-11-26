@@ -5,7 +5,6 @@
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --time=24:00:00
-#SBATCH --output=collect_maniskill_pusht_%j.out
 
 # PPO expert rollouts on OverheadPushT-v1 (scripts/data/collect_maniskill_pusht.py),
 # with the flags of the overhead_rgb_* datasets collected from mani-exps. The PPO
