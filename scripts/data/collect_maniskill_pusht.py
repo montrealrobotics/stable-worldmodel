@@ -102,6 +102,13 @@ def parse_args():
     )
     parser.add_argument('--image-size', type=int, default=None)
     parser.add_argument(
+        '--camera-fov',
+        type=float,
+        default=None,
+        help='Vertical fov (radians) of the saved camera; ManiSkill PushT videos '
+        'use 1.0 (render_camera), base_camera defaults to pi/2.',
+    )
+    parser.add_argument(
         '--no-save-rgb',
         dest='save_rgb',
         action='store_false',
@@ -1033,7 +1040,10 @@ def main():
     )
     validate_collection_checkpoint(weights, args.policy_type)
     _, training_config = collection_defaults(args.checkpoint)
-    sensor_configs = {'width': args.image_size, 'height': args.image_size}
+    saved_camera = {'width': args.image_size, 'height': args.image_size}
+    if args.camera_fov is not None:
+        saved_camera['fov'] = args.camera_fov
+    sensor_configs = dict(saved_camera)
     policy_cameras = None
     env_kwargs = {}
     if (
@@ -1044,6 +1054,9 @@ def main():
         # Render ManiSkill's stock PushT camera (original extrinsic) for the
         # dataset; RGB policies still receive only their training cameras.
         env_kwargs['include_base_camera'] = True
+        # Size/fov apply to the saved camera only; policy cameras keep their
+        # env defaults (the overhead datasets used the default 128 px).
+        sensor_configs = {'base_camera': dict(saved_camera)}
     if training_config and args.policy_type == 'rgb':
         import sapien
 
@@ -1056,10 +1069,7 @@ def main():
             sensor_configs[name] = settings
         policy_cameras = list(sensor_configs)
         if args.save_rgb and args.camera_name not in sensor_configs:
-            sensor_configs[args.camera_name] = {
-                'width': args.image_size,
-                'height': args.image_size,
-            }
+            sensor_configs[args.camera_name] = dict(saved_camera)
     # Correct chunks and alternatives run groups of candidates per expert
     # episode; spare groups in the last batch are collected and discarded.
     in_groups = bool(args.correct_chunks or args.alternatives)
