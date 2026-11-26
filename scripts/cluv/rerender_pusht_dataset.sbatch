@@ -56,8 +56,8 @@ python -u scripts/data/rerender_pusht_dataset.py \
 FILES=("$NAME.lance" "${NAME}_episodes.lance")
 # Test runs (--limit) are not archived.
 if [[ "$COLLECT_ARCHIVE" == 1 && "$LIMITED" == 0 ]]; then
-  if command -v pigz >/dev/null; then GZ=(pigz -p "${SLURM_CPUS_PER_TASK:-8}"); else GZ=(gzip); fi
-  tar -C "$LOCAL_DIR" -cf - "${FILES[@]}" | "${GZ[@]}" > "$LOCAL_DIR/$NAME.lance.tar.gz"
+  # Same layout as the earlier archives (tar -czf <name>.lance.tar.gz <name>.lance <name>_episodes.lance).
+  tar -C "$LOCAL_DIR" -czf "$LOCAL_DIR/$NAME.lance.tar.gz" "${FILES[@]}"
   cp "$LOCAL_DIR/$NAME.lance.tar.gz" "$OUTPUT.tar.gz.partial"
   mv "$OUTPUT.tar.gz.partial" "$OUTPUT.tar.gz"
   echo "Archived to $OUTPUT.tar.gz"
