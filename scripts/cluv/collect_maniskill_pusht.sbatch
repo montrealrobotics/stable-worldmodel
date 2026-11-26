@@ -20,7 +20,8 @@ set -euo pipefail
 
 CHECKPOINT="${CHECKPOINT:-/network/scratch/o/ozgur.aslan/maniskill_pusht_ppo/runs/pusht_overhead_rgb_spatial_softmax_learned_fs1_ar1_10754956/final_ckpt.pt}"
 CAMERA="${CAMERA:-base_camera}"
-ARCHIVE="${ARCHIVE:-1}"
+# Not ARCHIVE: Mila login shells export it as the archive storage path.
+COLLECT_ARCHIVE="${COLLECT_ARCHIVE:-1}"
 
 module load cuda/12.6.0/cudnn/9.3
 module load anaconda/3
@@ -51,7 +52,7 @@ python -u scripts/data/collect_maniskill_pusht.py \
   --reconfiguration-freq 0 --policy-mode deterministic \
   "$@"
 
-if [[ "$ARCHIVE" == 1 ]]; then
+if [[ "$COLLECT_ARCHIVE" == 1 ]]; then
   OUTPUT=""
   prev=""
   for arg in "$@"; do
