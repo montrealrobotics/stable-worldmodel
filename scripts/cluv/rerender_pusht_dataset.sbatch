@@ -33,5 +33,5 @@ cd "$SLURM_TMPDIR"
   --source "$SOURCE" --output "$NAME.lance" "$@"
 
 tar -czf "$NAME.lance.tar.gz" "$NAME.lance" "${NAME}_episodes.lance"
-cp -r "$NAME.lance" "${NAME}_episodes.lance" "$NAME.collection.json" "$NAME.lance.tar.gz" "$DEST_DIR/"
+cp "$NAME.collection.json" "$NAME.lance.tar.gz" "$DEST_DIR/"
 echo "Copied $NAME to $DEST_DIR"
