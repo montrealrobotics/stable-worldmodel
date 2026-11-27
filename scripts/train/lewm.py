@@ -192,9 +192,15 @@ def batchnorm_eval(model, enabled=True):
     batch. Gradients still reach the affine parameters. Other modules
     (dropout) keep their mode; each layer's previous mode is restored.
     """
-    layers = [
-        m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)
-    ] if enabled else []
+    layers = (
+        [
+            m
+            for m in model.modules()
+            if isinstance(m, nn.modules.batchnorm._BatchNorm)
+        ]
+        if enabled
+        else []
+    )
     modes = [m.training for m in layers]
     for m in layers:
         m.eval()
@@ -235,7 +241,11 @@ def plan_costs(model, batch, emb, cfg, plans, all_steps=False):
     B = actions.size(0)
     # detach_goal (default true): the goal and per-step targets are fixed, as in
     # planning; false lets the cost's gradient reach the encoder through them.
-    detach = (lambda x: x.detach()) if search.get('detach_goal', True) else (lambda x: x)
+    detach = (
+        (lambda x: x.detach())
+        if search.get('detach_goal', True)
+        else (lambda x: x)
+    )
     goal = detach(emb[:, H - 1 + T, None])
     targets = detach(emb[:, None, H : H + T])  # (B, 1, T, ...)
     skip = ('action', 'emb', 'act_emb')
@@ -376,11 +386,14 @@ def search_loss(model, batch, emb, cfg):
     batch, emb = search_batch(batch, emb, cfg)
     with batchnorm_eval(model, search.get('bn_eval', False)):
         plans = search_negatives(model, batch, emb, cfg)
-        costs = plan_costs(model, batch, emb, cfg, plans, all_steps)  # expert 0
+        costs = plan_costs(
+            model, batch, emb, cfg, plans, all_steps
+        )  # expert 0
     if all_steps:  # one InfoNCE per step: (B, S, T) -> (B * T, S)
         costs = costs.transpose(1, 2).flatten(0, 1)
     target = costs.new_zeros(costs.size(0), dtype=torch.long)
     return F.cross_entropy(-costs.float() / search.temperature, target)
+
 
 def search_anchor_loss(model, batch, emb, cfg):
     """Multi-step MSE of the expert plan's rollout against the clip's own frames.
@@ -406,15 +419,20 @@ def search_anchor_loss(model, batch, emb, cfg):
     with batchnorm_eval(model, cfg.loss.search.get('bn_eval', False)):
         pred = model.rollout(info, expert, H)['predicted_emb'][:, 0, H:]
     target = emb[:, H : H + T]
-    if cfg.loss.search.get('anchor_detach', True):  # false: the encoder also moves toward the rollout
+    if cfg.loss.search.get(
+        'anchor_detach', True
+    ):  # false: the encoder also moves toward the rollout
         target = target.detach()
     return (pred - target).pow(2).mean()
+
 
 def add_search_anchor(output, model, batch, emb, cfg):
     """Add ``loss.search.anchor_weight`` * search_anchor_loss (off when 0)."""
     weight = cfg.loss.search.get('anchor_weight', 0) or 0
     if weight > 0:
-        output['search_anchor_loss'] = search_anchor_loss(model, batch, emb, cfg)
+        output['search_anchor_loss'] = search_anchor_loss(
+            model, batch, emb, cfg
+        )
         output['loss'] = output['loss'] + weight * output['search_anchor_loss']
 
 
@@ -627,7 +645,9 @@ def lejepa_forward(self, batch, stage, cfg):
         yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
         target = torch.stack([yaw.sin(), yaw.cos()], -1)  # (B, T, 2)
         output['aux_yaw_loss'] = F.mse_loss(self.aux_head(emb), target)
-        output['loss'] = output['loss'] + aux_yaw.weight * output['aux_yaw_loss']
+        output['loss'] = (
+            output['loss'] + aux_yaw.weight * output['aux_yaw_loss']
+        )
     gfn_logs = {}
     if use_search_loss and search.get('sampler', 'cem') == 'gfn':
         step = self.trainer.fit_loop.total_batch_idx  # batches, not opt steps
@@ -658,7 +678,9 @@ def lejepa_forward(self, batch, stage, cfg):
     elif use_search_loss and search.get('separate_clips'):
         # Own longer clips (training only; validation batches carry none).
         if search_clips is not None:
-            search_clips['action'] = torch.nan_to_num(search_clips['action'], 0.0)
+            search_clips['action'] = torch.nan_to_num(
+                search_clips['action'], 0.0
+            )
             normalize_pixels(search_clips)
             s_emb = self.model.encode(search_clips)['emb']
             output['search_loss'] = search_loss(
@@ -757,6 +779,64 @@ def mix_onpolicy(
     return mixed
 
 
+def sample_expert_trajectories(dataset, n, seed):
+    """Load ``n`` random expert episodes (pixels only) for a W&B sanity check.
+
+    Experts are episodes whose ``collection_mode`` is ``deterministic`` when the
+    dataset has that episode column; otherwise any episode qualifies.
+    """
+    if n <= 0:
+        return []
+    lengths = np.asarray(dataset.lengths)
+    candidates = np.flatnonzero(lengths > 0)
+    if 'collection_mode' in getattr(dataset, 'episode_column_names', []):
+        modes = np.asarray(
+            dataset.get_episode_data()['collection_mode'], dtype=object
+        )
+        candidates = candidates[modes[candidates] == 'deterministic']
+    rng = np.random.default_rng(seed)
+    picked = rng.choice(
+        candidates, size=min(n, len(candidates)), replace=False
+    )
+    trajectories = []
+    for ep in sorted(picked.tolist()):
+        pixels = dataset.load_episode(ep)['pixels']
+        pixels = torch.as_tensor(pixels)
+        if pixels.shape[-1] in (1, 3):  # (T, H, W, C) -> (T, C, H, W)
+            pixels = pixels.permute(0, 3, 1, 2)
+        trajectories.append((ep, pixels.to(torch.uint8).numpy()))
+    return trajectories
+
+
+def log_expert_trajectories(logger, trajectories, fps=10):
+    """Log sampled trajectories as W&B videos (frame strips if encoding fails)."""
+    import tempfile
+
+    import wandb
+
+    media = []
+    for ep, frames in trajectories:  # frames: (T, C, H, W) uint8
+        caption = f'episode {ep}, {len(frames)} frames'
+        try:
+            import imageio
+
+            path = Path(tempfile.mkdtemp()) / f'episode_{ep}.mp4'
+            imageio.mimwrite(
+                path, frames.transpose(0, 2, 3, 1), fps=fps, macro_block_size=1
+            )
+            media.append(wandb.Video(str(path), caption=caption, format='mp4'))
+        except Exception as error:  # no ffmpeg: a strip of up to 8 frames
+            print(f'Video encoding failed ({error}); logging a frame strip.')
+            idx = np.linspace(0, len(frames) - 1, min(8, len(frames))).astype(
+                int
+            )
+            strip = np.concatenate(
+                list(frames[idx].transpose(0, 2, 3, 1)), axis=1
+            )
+            media.append(wandb.Image(strip, caption=caption))
+    logger.experiment.log({'data/expert_trajectories': media})
+
+
 @hydra.main(version_base=None, config_path='./config', config_name='lewm')
 def run(cfg):
     #########################
@@ -795,6 +875,15 @@ def run(cfg):
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
+    # Raw frames of a few random expert episodes, logged to W&B below.
+    expert_trajectories = []
+    if cfg.get('log_trajectories', 0) and cfg.wandb.enabled:
+        try:
+            expert_trajectories = sample_expert_trajectories(
+                dataset, cfg.log_trajectories, cfg.seed
+            )
+        except Exception as error:
+            print(f'Could not sample expert trajectories: {error}')
     transforms = [
         # uint8 batches: 4x less host-to-GPU copy, normalized in the forward.
         get_img_preprocessor(
@@ -889,8 +978,12 @@ def run(cfg):
         search_set.transform = transform
         if replay_filter:
             search_set = filter_replay_episodes(search_set, **replay_filter)
-        print(f'Search clips: {len(search_set)} of {clip_cfg["num_steps"]} frames')
-        train_set = WithSearchClips(train_set, search_set, search_cfg.batch_size)
+        print(
+            f'Search clips: {len(search_set)} of {clip_cfg["num_steps"]} frames'
+        )
+        train_set = WithSearchClips(
+            train_set, search_set, search_cfg.batch_size
+        )
         loader_extra['collate_fn'] = collate_with_search
 
     train = torch.utils.data.DataLoader(
@@ -983,6 +1076,11 @@ def run(cfg):
     if cfg.wandb.enabled:
         logger = WandbLogger(**cfg.wandb.config)
         logger.log_hyperparams(OmegaConf.to_container(cfg))
+        if expert_trajectories:
+            try:
+                log_expert_trajectories(logger, expert_trajectories)
+            except Exception as error:
+                print(f'Could not log expert trajectories: {error}')
 
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / 'config.yaml', 'w') as f:

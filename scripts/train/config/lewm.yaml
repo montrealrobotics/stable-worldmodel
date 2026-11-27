@@ -23,6 +23,8 @@ compile: true
 save_step_interval: null
 # Export weights_epoch_N.pt every N epochs; the final weights always save.
 save_epoch_interval: 5
+# Log this many random expert episodes (raw frames) to W&B at start; 0 disables.
+log_trajectories: 0
 # Encoder loss-gradient diagnostics at steps 0, 100, ...; 0 disables them.
 gradient_diagnostics_interval: 100
 
