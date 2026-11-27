@@ -1,0 +1,10 @@
+# OverheadPushT-v1 evaluated from ManiSkill's stock PushT base_camera (fov 1 rad,
+# the ManiSkill video framing), matching basecam_fov1_* datasets. The RGB expert
+# still acts on overhead_camera to build goals.
+defaults:
+  - maniskill_overhead
+  - _self_
+subdir: basecam_vision_${now:%Y%m%d_%H%M%S}
+world:
+  camera_name: base_camera
+  camera_fov: 1.0

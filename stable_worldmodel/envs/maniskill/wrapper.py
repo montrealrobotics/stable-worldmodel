@@ -143,6 +143,7 @@ class ManiSkillSWMEnv(gym.Env):
         expert_policy_type='state',
         expert_encoder='spatial_softmax',
         simulation_max_episode_steps=None,
+        camera_fov=None,
         **kwargs,
     ):
         """Create the scene and optionally load a compatible PPO expert.
@@ -198,6 +199,29 @@ class ManiSkillSWMEnv(gym.Env):
                 kwargs.setdefault(key, value)
         if env_id == 'OverheadPushT-v1':
             from . import overhead_pusht  # noqa: F401
+        # OverheadPushT renders only overhead_camera (the RGB expert's input);
+        # base_camera (stock PushT view, optionally with camera_fov) is added
+        # for the world model and the expert keeps acting on the others.
+        extra_camera = (
+            env_id == 'OverheadPushT-v1' and camera_name == 'base_camera'
+        )
+        if extra_camera:
+            kwargs['include_base_camera'] = True
+            camera = {'width': image_size, 'height': image_size}
+            if camera_fov is not None:
+                camera['fov'] = camera_fov
+            if self._expert is not None and self._expert.saved:
+                sensor_configs = {**sensor_configs, 'base_camera': camera}
+            else:
+                sensor_configs = {'base_camera': camera}
+        elif camera_fov is not None:
+            sensor_configs = {
+                camera_name: {
+                    'width': image_size,
+                    'height': image_size,
+                    'fov': camera_fov,
+                }
+            }
         if simulation_max_episode_steps is not None:
             kwargs['max_episode_steps'] = simulation_max_episode_steps
         # Reuse these settings for the separate expert-query simulator.
@@ -241,6 +265,10 @@ class ManiSkillSWMEnv(gym.Env):
             }
         )
         if self._expert is not None:
+            if extra_camera:
+                self._expert.cameras = [
+                    c for c in obs['sensor_data'] if c != 'base_camera'
+                ]
             self._expert.build(self.env, obs, self.action_space)
 
     def _goal_errors(self, base=None):

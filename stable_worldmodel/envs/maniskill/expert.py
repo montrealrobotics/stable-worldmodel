@@ -29,6 +29,8 @@ class ManiSkillExpert:
         self.inferred, self.saved = collection_defaults(checkpoint)
         self.model = None
         self.device = None
+        # RGB sensors the policy sees (None: every sensor in the obs).
+        self.cameras = None
 
     def check_env(self, env_id, control_mode, camera_name, image_size):
         """Fail when the evaluation env differs from the expert's training env."""
@@ -37,7 +39,9 @@ class ManiSkillExpert:
             'control_mode': control_mode,
             'policy_type': self.policy_type,
         }
-        if self.policy_type == 'rgb':
+        if self.policy_type == 'rgb' and not (
+            env_id == 'OverheadPushT-v1' and camera_name == 'base_camera'
+        ):  # base_camera is only rendered for the world model
             expected.update(
                 camera_name=camera_name,
                 image_size=image_size,
@@ -101,7 +105,7 @@ class ManiSkillExpert:
             )
             model = experts.RGBExpert(
                 env,
-                policy_observation(obs, self.device, 'rgb'),
+                policy_observation(obs, self.device, 'rgb', self.cameras),
                 encoder=self.encoder,
                 **options,
             )
@@ -130,7 +134,9 @@ class ManiSkillExpert:
     def act(self, obs):
         """Deterministic actions for every env, clipped, as a NumPy array."""
         action = self.model.get_action(
-            policy_observation(obs, self.device, self.policy_type),
+            policy_observation(
+                obs, self.device, self.policy_type, self.cameras
+            ),
             deterministic=True,
         )
         if isinstance(action, torch.Tensor):

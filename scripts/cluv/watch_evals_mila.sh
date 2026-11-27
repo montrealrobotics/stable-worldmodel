@@ -3,6 +3,8 @@
 # Run on a Mila login node, in tmux, from the repository root:
 #   bash scripts/cluv/watch_evals_mila.sh <train job id> [<train job id> ...]
 #   EPOCHS="5 10 15 16 17 18 19 20" (default)  POLL_SECONDS=120
+#   Runs trained on basecam_fov1_* data: DATASET=basecam_fov1_noisy_replay_100k EVAL_CONFIG=maniskill_basecam
+#   (passed through to eval_checkpoint_mila.sh)
 # For each job, the run dir is $L/checkpoints/*_<job id>. Each listed weights_epoch_N.pt is
 # handed to scripts/cluv/eval_checkpoint_mila.sh once complete (size unchanged for 30 s;
 # torch.save is not atomic). A marker .eval_submitted_N in the run dir prevents repeats, also
