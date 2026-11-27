@@ -28,6 +28,9 @@ if [[ -f "$CACHE_TAR" ]]; then
 else
   export EXPERT_CACHE_DIR=$L/expert_goal_cache_$EVAL_CONFIG; mkdir -p "$EXPERT_CACHE_DIR"
 fi
+# Planning history = the run's training history (wm.history_size in its config.yaml), unless set.
+HISTORY_LEN=${HISTORY_LEN:-$(awk '/^wm:/{w=1;next} w&&/^[^ ]/{exit} w&&$1=="history_size:"{print $2;exit}' "$RUN_DIR/config.yaml" 2>/dev/null || true)}
+export HISTORY_LEN=${HISTORY_LEN:-1}
 cd "$(dirname "$0")/../.."
 CHECKPOINTS="$RUN_DIR/weights_epoch_$EPOCH.pt" GOAL_OFFSETS='10 15 20 25' \
 VENV_TAR=$L/swm_venv.tar DATASET_TAR=$L/datasets/$DATASET.lance.tar.gz \
