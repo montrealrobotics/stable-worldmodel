@@ -17,10 +17,14 @@ GPU=${EVAL_GPU:-l40s}
 # basecam_* datasets: DATASET=basecam_fov1_noisy_replay_100k EVAL_CONFIG=maniskill_basecam.
 DATASET=${DATASET:-overhead_rgb_noisy_replay_100k}
 EVAL_CONFIG=${EVAL_CONFIG:-maniskill_overhead}
-# The overhead goal cache is a tar copied to each job; other configs build goals in a shared
-# per-config cache dir (the cache key includes the camera, so caches never mix).
-if [[ "$EVAL_CONFIG" == maniskill_overhead ]]; then
-  export EXPERT_CACHE_TAR=$L/expert_goal_cache.tar
+# Expert goals: a frozen cache tar (top-level expert_goal_cache/) is copied to each job;
+# without one, goals are built in a shared per-config dir (the cache key includes the camera,
+# so caches never mix). Freeze a complete dir with:
+#   tar -cf $L/expert_goal_cache_<config>.tar -C $L --transform 's,^expert_goal_cache_<config>,expert_goal_cache,' expert_goal_cache_<config>
+CACHE_TAR=$L/expert_goal_cache_$EVAL_CONFIG.tar
+[[ "$EVAL_CONFIG" == maniskill_overhead ]] && CACHE_TAR=$L/expert_goal_cache.tar
+if [[ -f "$CACHE_TAR" ]]; then
+  export EXPERT_CACHE_TAR=$CACHE_TAR
 else
   export EXPERT_CACHE_DIR=$L/expert_goal_cache_$EVAL_CONFIG; mkdir -p "$EXPERT_CACHE_DIR"
 fi
