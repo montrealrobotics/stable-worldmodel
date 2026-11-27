@@ -183,6 +183,20 @@ def main():
     episodes = args.source.with_name(args.source.stem + '_episodes.lance')
     if episodes.exists():
         ep = lance.dataset(str(episodes)).to_table()
+        if args.limit is not None:  # keep only episodes present in the output
+            import pyarrow.compute as pc
+
+            present = pa.array(
+                np.unique(
+                    lance.dataset(str(args.output))
+                    .to_table(columns=['episode_idx'])
+                    .column('episode_idx')
+                    .to_numpy()
+                )
+            )
+            ep = ep.filter(
+                pc.is_in(ep.column('episode_idx'), value_set=present)
+            )
         lance.write_dataset(
             ep,
             str(args.output.with_name(args.output.stem + '_episodes.lance')),
